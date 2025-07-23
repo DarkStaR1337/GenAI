@@ -1,86 +1,400 @@
-SYSTEM_PROMPT = """
-You are an expert invoice analysis assistant specializing in analyzing general invoices and receipts. Your task is to extract data from invoices and format it into a standardized 24-column table row format.
+from langchain_aws import ChatBedrockConverse
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+import sqlite3
+import logging
+from typing import List, Dict, Any
+import os
 
-### Core Processing Rules:
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-**Invoice Type Classification:**
-- 'Tax Invoice' if GST is mentioned
-- 'Bill' if no GST is mentioned  
-- 'Credit Note' or 'Debit Note' based on document content
+class LangChainBedrockIAMBot:
+    """IAM Assistant using LangChain with ChatBedrockConverse and tool calling."""
+    
+    def __init__(self, region_name: str = 'us-east-1', model_id: str = "anthropic.claude-3-sonnet-20240229-v1:0"):
+        self.region_name = region_name
+        self.model_id = model_id
+        
+        # Initialize ChatBedrockConverse
+        self.llm = ChatBedrockConverse(
+            model=model_id,
+            region_name=region_name,
+            model_kwargs={
+                "temperature": 0.1,
+                "max_tokens": 2000,
+            }
+        )
+        
+        # System prompt adapted from your original
+        self.system_prompt = """You are a helpful assistant that helps the user get information on Identity Access Management (IAM).
+Understand the user's query, then use the available tools to get the required information. The current userID is '{user}'.
 
-**Taxable vs Non-Taxable Value Logic (CRITICAL):**
-- Values are mutually exclusive per row
-- IF any GST field (CGSTValue, SGSTValue, IGSTValue, GSTAmount, TotalGSTRate) > 0: assign Base Fare/Main Value to 'Taxable Value', set 'Non-Taxable Value' = 'N/A'
-- IF all GST fields are missing/null/0: assign Base Fare/Main Value to 'Non-Taxable Value', set 'Taxable Value' = 'N/A'
+Instructions:
+1. When creating a query with AppName, use AppName LIKE '%...%' instead of AppName='...'.
+2. If there are 2 records for the same first name, also check the last name. Provide answers according to the user's question.
+3. If the user query includes a Request ID, call get_access_request_status().
+4. If the user asks for Dormant and/or Orphan accounts, call get_app_dormant_or_orphan_status().
+5. Understand the user query and, if necessary, make multiple tool calls to the same or different function.
+6. If the user requests data in a tabular format, provide the final response as a markdown string for the tabular data.
+7. Understand the user query completely and answer appropriately. Get completely to all subparts (if any).
+8. Do not reveal the SQL query or internal processing in the final response. Retry if necessary and always provide the correct response.
+9. When asked for the status of a request, consider the column "TaskStatus" or "AccountStatus" not "Status".
+10. Do not return columns that are not necessary for the user's query.
+11. Provide maximum relevant details.
+12. If fetching a list of users, run two tool calls: the first for fetching the complete records without limiting and the second for the total number of rows.
+13. Do not add "-" in the queries created.
+14. No Unions make two tool calls if required from two separate tables because column names are different.
+15. Be consistent with your answer.
+16. When asked for "orphan or dormant accounts" make two tool calls, one for dormant one for orphan and do not put any check/filter in the query.
+17. When asked for managers's status, make two tool calls, one for finding who is then manager and one for finding the status for the manager name.
+18. Retry if necessary internally but do not give incomplete answers. Do not generate final answer with information that is not required.
+19. Be consistent with your answers and do not hallucinate.
+20. When asked for reportees. Return only the reportees with active status."""
+        
+        # Initialize tools and agent
+        self.tools = self._create_tools()
+        self.agent_executor = self._create_agent()
 
-**GST Calculation Logic:**
-- If IGST > 0: CGST and SGST must be 0/N/A (IGST Rate = GST Rate)
-- If CGST and SGST > 0: IGST must be 0/N/A (CGST = SGST = Taxable Value × GST Rate ÷ 2 ÷ 100)
-- Never have IGST and CGST/SGST together for same item
-- If line item has taxable value + GST rate but no explicit GST values: calculate GST = Taxable Value × GST Rate ÷ 100
+    def _create_tools(self):
+        """Create LangChain tools from your existing functions."""
+        
+        @tool
+        def get_iam_data(query: str) -> str:
+            """Useful for getting Identity Access Management (IAM) data from a SQLite database containing IAM access information.
+            
+            Args:
+                query: SQL query to get the required information from an IAM SQLite database, based on the user's question. 
+                       Do not filter for active users unless specified by the user. SQL query must be in accordance to the table descriptions.
+            """
+            return self._execute_iam_query(query)
+        
+        @tool
+        def get_access_request_status(req_id: str) -> str:
+            """Useful for getting the request details of an access request for a single request ID.
+            
+            Args:
+                req_id: The request ID for the access request.
+            """
+            return self._get_request_status(req_id)
+        
+        @tool
+        def get_app_dormant_or_orphan_status(query: str) -> str:
+            """Useful for getting app dormant or orphan status data.
+            
+            Args:
+                query: SQL query to get app dormant or orphan status information.
+            """
+            return self._execute_dormant_orphan_query(query)
+        
+        return [get_iam_data, get_access_request_status, get_app_dormant_or_orphan_status]
 
-**OVERRIDE INSTRUCTION FOR TOTALS (HIGH PRIORITY):**
-- Compare calculated Grand Total with extracted Grand Total
-- If they don't match (>0.1 INR difference):
-  - IGNORE all extracted CGST, SGST, IGST, Cess values
-  - FORCE recalculation using only Taxable Value and GST Rate
-  - Use recalculated values for all rows and totals
-- Only use extracted GST values if totals match within 0.1 INR
+    def _create_agent(self):
+        """Create the LangChain agent with tools."""
+        
+        # Create prompt template
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", self.system_prompt),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+        
+        # Create agent
+        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        
+        # Create agent executor
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=self.tools,
+            verbose=True,  # Set to False in production
+            max_iterations=5,  # Prevent infinite loops
+            early_stopping_method="generate"
+        )
+        
+        return agent_executor
 
-**Formatting Requirements:**
-- Each row must have exactly 24 columns (25 pipes)
-- Begin and end each row with pipe '|'
-- Use 'N/A' for missing fields, never skip columns
-- Remove commas from numeric values
-- Two decimal places for all amounts (xx.xx)
-- Use '0.00' only when explicitly zero in data
-- No markdown formatting
-- Separate rows for each HSN/SAC + description pair (don't merge unless both HSN/SAC AND description identical)
-- Remove non-alphanumeric characters from GSTIN fields
-- Capture complete vendor legal name if available
-- Only populate 'Place of Supply' if explicitly present
+    def get_response(self, user: str, messages: List[Dict]) -> str:
+        """
+        Main function to handle user queries. 
+        This replaces your original get_response function.
+        """
+        try:
+            # Extract the latest user message
+            user_input = messages[-1]['content'] if messages else ""
+            
+            # Format system prompt with user context
+            formatted_system_prompt = self.system_prompt.format(user=user)
+            
+            # Create the input for the agent
+            agent_input = {
+                "input": user_input,
+                "user": user  # Pass user context
+            }
+            
+            # Execute the agent
+            result = self.agent_executor.invoke(agent_input)
+            
+            # Return the final response
+            return result.get("output", "No response generated")
+            
+        except Exception as e:
+            logger.error(f"Error in get_response: {str(e)}")
+            return f"An error occurred while processing your request: {str(e)}"
 
-**Date Handling:**
-- Invoice Date: Use exact format from 'InvoiceDate' field, no modifications
-- Original Invoice fields: Only for Credit/Debit Notes, otherwise 'N/A'
+    # Your existing database query methods adapted for LangChain tools
+    def _execute_iam_query(self, query: str) -> str:
+        """Execute IAM database query - adapted from your original get_iam_data."""
+        if not query.strip():
+            return "No query provided"
+        
+        try:
+            # Update this path to your actual database
+            connection = sqlite3.connect('your_iam_database.db')  # Replace with your DB path
+            cursor = connection.cursor()
+            
+            # Execute the query
+            cursor.execute(query)
+            results = cursor.fetchall()
+            
+            # Get column names
+            column_names = [description[0] for description in cursor.description]
+            
+            connection.close()
+            
+            if not results:
+                return "No data found for the given query."
+            
+            # Format results as string
+            formatted_results = f"Query results ({len(results)} rows):\n"
+            formatted_results += f"Columns: {', '.join(column_names)}\n\n"
+            
+            for i, row in enumerate(results[:50]):  # Limit to first 50 rows
+                row_data = [str(val) if val is not None else 'NULL' for val in row]
+                formatted_results += f"Row {i+1}: {dict(zip(column_names, row_data))}\n"
+            
+            if len(results) > 50:
+                formatted_results += f"\n... and {len(results) - 50} more rows"
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Database error in _execute_iam_query: {str(e)}")
+            return f"Database error: {str(e)}"
 
-**Others Column:**
-- Include all relevant numerical values not in GST/Taxable/Non-Taxable columns
-- Format with sign and description: e.g., "-260 (airplane penalty deduction)"
+    def _get_request_status(self, req_id: str) -> str:
+        """Get access request status - adapted from your original function."""
+        if not req_id.strip():
+            return "No request ID provided"
+        
+        try:
+            connection = sqlite3.connect('your_iam_database.db')  # Replace with your DB path
+            cursor = connection.cursor()
+            
+            # Query for access request status (adjust table name as needed)
+            query = """
+                SELECT * FROM access_request 
+                WHERE RequestedBy = ? OR TaskStatus = ? OR RequestID = ?
+            """
+            cursor.execute(query, (req_id, req_id, req_id))
+            results = cursor.fetchall()
+            
+            column_names = [description[0] for description in cursor.description]
+            connection.close()
+            
+            if not results:
+                return f"No access request found for ID: {req_id}"
+            
+            # Format results
+            formatted_results = f"Access request status for ID {req_id}:\n"
+            for row in results:
+                row_data = dict(zip(column_names, row))
+                formatted_results += f"{row_data}\n"
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Database error in _get_request_status: {str(e)}")
+            return f"Database error: {str(e)}"
 
-**Total Calculation:**
-- Total Invoice Value (calculated) = Taxable Value + Total GST + Non-Taxable Value + sum of Others
-- Always verify calculation accuracy
+    def _execute_dormant_orphan_query(self, query: str) -> str:
+        """Execute dormant/orphan query - adapted from your original function."""
+        if not query.strip():
+            return "No query provided"
+        
+        try:
+            connection = sqlite3.connect('your_iam_database.db')  # Replace with your DB path
+            cursor = connection.cursor()
+            
+            cursor.execute(query)
+            results = cursor.fetchall()
+            column_names = [description[0] for description in cursor.description]
+            connection.close()
+            
+            if not results:
+                return "No dormant or orphan accounts found."
+            
+            # Format results
+            formatted_results = f"Dormant/Orphan status results ({len(results)} records):\n"
+            formatted_results += f"Columns: {', '.join(column_names)}\n\n"
+            
+            for i, row in enumerate(results):
+                row_data = dict(zip(column_names, row))
+                formatted_results += f"Record {i+1}: {row_data}\n"
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Database error in _execute_dormant_orphan_query: {str(e)}")
+            return f"Database error: {str(e)}"
+
+
+# Simple wrapper to match your existing interface
+class BedrockIAMBot:
+    """Simple wrapper to maintain compatibility with your existing code."""
+    
+    def __init__(self, region_name: str = 'us-east-1'):
+        self.bot = LangChainBedrockIAMBot(region_name=region_name)
+    
+    def get_response(self, user: str, messages: List[Dict]) -> str:
+        """Drop-in replacement for your existing get_response function."""
+        return self.bot.get_response(user, messages)
+
+
+# Example usage showing how to replace your existing code
+def main():
+    """Example of how to use the new LangChain Bedrock IAM bot."""
+    
+    # Initialize the bot (same interface as before)
+    bot = BedrockIAMBot(region_name='us-east-1')
+    
+    # Example conversation
+    user = "john.doe"
+    messages = [
+        {"role": "user", "content": "What are the active permissions for user alice.smith?"}
+    ]
+    
+    # Get response - same interface as your OpenAI version!
+    response = bot.get_response(user, messages)
+    print("Bot response:", response)
+
+
+# Alternative: Direct usage with more LangChain features
+def advanced_example():
+    """Example showing more advanced LangChain features."""
+    
+    bot = LangChainBedrockIAMBot()
+    
+    # You can also use LangChain's message types directly
+    messages = [
+        SystemMessage(content="You are an IAM assistant."),
+        HumanMessage(content="Show me all dormant accounts in the system")
+    ]
+    
+    # Direct agent execution with more control
+    result = bot.agent_executor.invoke({
+        "input": "Show me all users with admin privileges",
+        "user": "admin_user"
+    })
+    
+    print("Advanced result:", result["output"])
+
+
+if __name__ == "__main__":
+    main()
+
+
+# Setup and installation guide
+def setup_guide():
+    """Setup instructions for LangChain + Bedrock."""
+    instructions = """
+    SETUP INSTRUCTIONS:
+    
+    1. Install required packages:
+       pip install langchain-aws langchain langchain-core boto3
+    
+    2. Set AWS credentials (one of these methods):
+       - AWS CLI: aws configure
+       - Environment variables:
+         export AWS_ACCESS_KEY_ID=your_key
+         export AWS_SECRET_ACCESS_KEY=your_secret
+         export AWS_DEFAULT_REGION=us-east-1
+    
+    3. Request Bedrock model access:
+       - Go to AWS Bedrock console
+       - Request access for: anthropic.claude-3-sonnet-20240229-v1:0
+       - Wait for approval (usually a few minutes)
+    
+    4. Update database path:
+       - Replace 'your_iam_database.db' with your actual database path
+       - Update table names in SQL queries as needed
+    
+    5. Test connection:
+       Run test_connection() function below
+    """
+    print(instructions)
+
+
+def test_connection():
+    """Test if LangChain + Bedrock connection is working."""
+    try:
+        # Test basic LLM connection
+        llm = ChatBedrockConverse(
+            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            region_name="us-east-1"
+        )
+        
+        response = llm.invoke([HumanMessage(content="Hello, can you respond with 'Connection successful'?")])
+        print("✅ LangChain + Bedrock connection successful!")
+        print(f"Response: {response.content}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Connection failed: {e}")
+        print("\nTroubleshooting:")
+        print("1. Check AWS credentials: aws sts get-caller-identity")
+        print("2. Verify Bedrock model access in AWS console")
+        print("3. Check region settings")
+        return False
+
+
+# Migration notes and checklist
 """
+MIGRATION FROM OPENAI TO LANGCHAIN + BEDROCK:
 
-USER_PROMPT = """
-Extract data from the following invoice and format it into standardized table rows:
+WHAT CHANGED:
+✅ OpenAI client → ChatBedrockConverse
+✅ Function definitions → @tool decorators  
+✅ Manual tool orchestration → Automatic via LangChain agent
+✅ Custom message handling → LangChain message types
+✅ Error handling → Built into LangChain
 
-**Invoice Information:**
-- File Name: {filename}
-- Invoice Sequence Number: {sequence_number}
-- Extracted JSON Data: {json_data}
+WHAT STAYS THE SAME:
+✅ Your database query logic (get_iam_data, etc.)
+✅ System prompt and instructions
+✅ get_response(user, messages) interface
+✅ Message format for your existing code
 
-**Required Output Format:**
+BENEFITS OF LANGCHAIN:
+- Automatic tool calling orchestration
+- Better error handling and retries
+- Built-in conversation memory
+- Easy to extend with more tools
+- Compatible with other LangChain components
 
-Generate table rows with exactly 24 columns in this order:
+MIGRATION STEPS:
+1. pip install langchain-aws langchain langchain-core boto3
+2. Set up AWS credentials and Bedrock access
+3. Replace your get_response function with BedrockIAMBot
+4. Update database paths in the code
+5. Test with your existing queries
 
-| Sr. No | File Name | UIN of Customer (GSTIN) | Vendor GSTIN | Vendor Name | Invoice Type | Invoice Number | Invoice Date | Original Invoice Number | Original Invoice Date | HSN/SAC Code | Service/Product Description | Place of Supply | Taxable Value (INR) | GST Rate (%) | CGST (INR) | SGST (INR) | IGST (INR) | Cess (INR) | Total GST (INR) | Non-Taxable Value (INR) | Others (INR) | Total Invoice Value - calculated (INR) | Total Invoice Value - extracted (INR) |
+MINIMAL CHANGE REQUIRED:
+Just replace your current bot initialization:
+OLD: bot = YourOpenAIBot()
+NEW: bot = BedrockIAMBot()
 
-**Row Format:**
-```
-| {sequence_number} | {filename} | [Customer GSTIN] | [Vendor GSTIN] | [Vendor Name] | [Invoice Type] | [Invoice Number] | [Invoice Date] | [Original Invoice Number] | [Original Invoice Date] | [HSN/SAC] | [Description] | [Place of Supply] | [Taxable Value] | [GST Rate] | [CGST] | [SGST] | [IGST] | [Cess] | [Total GST] | [Non-Taxable] | [Others] | [Calculated Total] | [Extracted Grand Total] |
-```
-
-**Total Row Format:**
-```
-| Total of {sequence_number} | {filename} | [Customer GSTIN] | [Vendor GSTIN] | [Vendor Name] | [Invoice Type] | [Invoice Number] | | | | | | | [Total Taxable] | | [Total CGST] | [Total SGST] | [Total IGST] | [Total Cess] | [Total GST] | [Total Non-Taxable] | [Total Others] | [Grand Total] | [Extracted Grand Total] |
-```
-
-**Requirements:**
-- Create one row per HSN/SAC + description combination
-- Add final total row with "Total of {sequence_number}"
-- If description missing, construct informative description from related fields
-- Return only the table rows, no additional text
-- Ensure all 24 columns present in every row (use 'N/A' for missing values)
+Everything else works the same!
 """
