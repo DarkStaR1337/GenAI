@@ -1,0 +1,217 @@
+@app.post("/send_message_IAM")
+def send_message(request: QueryRequest):
+    try:
+        logger.info(f"chat request: {request}")
+        global last_conversation_IAM
+        messages = []
+        response = ""
+        
+        # Get the last conversation (keep only last 2 exchanges to avoid context overflow)
+        last_conversation_IAM = last_conversation_IAM[-2:]
+        
+        # Append the current query to the last conversation
+        messages = last_conversation_IAM + [{"role": "user", "content": request.query}]
+        last_conversation_IAM = last_conversation_IAM + [{"role": "user", "content": request.query}]
+        
+        # Call the new Bedrock-based get_response function
+        response = bot.get_response(request.user, messages)
+        
+        # Handle different response types from LangChain
+        if response is None or response == "":
+            logger.error("Empty response from get_response function")
+            response = "I apologize, but I'm unable to process your request at the moment. Please try again."
+        
+        # Ensure response is a string
+        if not isinstance(response, str):
+            logger.warning(f"Response is not a string, converting: {type(response)}")
+            response = str(response)
+        
+        # Store the query and response
+        store_db.store_query_response_IAM(request.user_id, request.query, response, "text")
+        
+        # Update conversation history
+        last_conversation_IAM = last_conversation_IAM + [{"role": "assistant", "content": response}]
+        last_conversation_IAM = last_conversation_IAM[-2:]  # Keep only last 2 exchanges
+        
+        logger.info(f"chat response: {response}")
+        
+        return {"text": response, "graph_data": None, "type": "text"}
+        
+    except Exception as e:
+        logger.error(f"Error in send_message: {str(e)}")
+        logger.error(f"Exception type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Return a proper error response instead of raising HTTPException
+        error_response = "I encountered an error while processing your request. Please try again or rephrase your question."
+        
+        try:
+            # Still try to store the error for tracking
+            store_db.store_query_response_IAM(request.user_id, request.query, f"Error: {str(e)}", "error")
+        except:
+            pass  # Don't let storage errors prevent error response
+            
+        return {"text": error_response, "graph_data": None, "type": "text"}
+
+# Alternative version with better error handling and debugging
+@app.post("/send_message_IAM_debug")
+def send_message_debug(request: QueryRequest):
+    try:
+        logger.info(f"chat request: {request}")
+        global last_conversation_IAM
+        messages = []
+        response = ""
+        
+        # Debug: Log the current conversation state
+        logger.info(f"Current conversation length: {len(last_conversation_IAM)}")
+        
+        # Get the last conversation (keep only last 2 exchanges)
+        last_conversation_IAM = last_conversation_IAM[-2:]
+        
+        # Prepare messages for the bot
+        messages = last_conversation_IAM + [{"role": "user", "content": request.query}]
+        
+        logger.info(f"Sending {len(messages)} messages to bot")
+        logger.info(f"Messages structure: {[msg.get('role', 'unknown') for msg in messages]}")
+        
+        # Call the bot function
+        response = bot.get_response(request.user, messages)
+        
+        # Debug: Log response details
+        logger.info(f"Response type: {type(response)}")
+        logger.info(f"Response length: {len(str(response)) if response else 0}")
+        logger.info(f"Response preview: {str(response)[:200] if response else 'None'}")
+        
+        # Validate and clean response
+        if response is None:
+            logger.error("get_response returned None")
+            response = "I'm sorry, I couldn't generate a response. Please try rephrasing your question."
+        elif response == "":
+            logger.error("get_response returned empty string")
+            response = "I received your question but couldn't generate a proper response. Please try again."
+        elif not isinstance(response, str):
+            logger.warning(f"Converting non-string response: {type(response)}")
+            response = str(response)
+        
+        # Check for common error patterns in response
+        if "error" in response.lower() and len(response) < 50:
+            logger.warning(f"Potential error response detected: {response}")
+            response = "I encountered an issue processing your request. Please try rephrasing your question or contact support if the problem persists."
+        
+        # Store the interaction
+        try:
+            store_db.store_query_response_IAM(request.user_id, request.query, response, "text")
+        except Exception as storage_error:
+            logger.error(f"Storage error: {storage_error}")
+            # Don't fail the request due to storage issues
+        
+        # Update conversation history
+        last_conversation_IAM.append({"role": "user", "content": request.query})
+        last_conversation_IAM.append({"role": "assistant", "content": response})
+        last_conversation_IAM = last_conversation_IAM[-4:]  # Keep last 2 exchanges (4 messages)
+        
+        logger.info(f"Final response length: {len(response)}")
+        logger.info(f"Conversation updated, new length: {len(last_conversation_IAM)}")
+        
+        return {"text": response, "graph_data": None, "type": "text"}
+        
+    except Exception as e:
+        logger.error(f"Exception in send_message: {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        
+        # Import traceback for detailed error logging
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        # Check if it's a specific AWS/Bedrock error
+        if "bedrock" in str(e).lower() or "aws" in str(e).lower():
+            error_response = "I'm having trouble connecting to the AI service. Please try again in a moment."
+        elif "tool" in str(e).lower():
+            error_response = "I encountered an issue while accessing the database. Please try rephrasing your question."
+        elif "timeout" in str(e).lower():
+            error_response = "The request timed out. Please try again with a simpler question."
+        else:
+            error_response = "I'm experiencing technical difficulties. Please try again or contact support."
+        
+        # Try to store the error for debugging
+        try:
+            store_db.store_query_response_IAM(
+                request.user_id, 
+                request.query, 
+                f"Error: {str(e)}", 
+                "error"
+            )
+        except:
+            logger.error("Failed to store error in database")
+        
+        return {"text": error_response, "graph_data": None, "type": "text"}
+
+# Helper function to validate bot response
+def validate_bot_response(response, user_query):
+    """Validate and clean the bot response"""
+    
+    if response is None:
+        logger.error("Bot returned None response")
+        return "I'm unable to process your request right now. Please try again."
+    
+    if not isinstance(response, str):
+        logger.warning(f"Bot returned non-string response: {type(response)}")
+        response = str(response)
+    
+    if len(response.strip()) == 0:
+        logger.error("Bot returned empty response")
+        return "I received your question but couldn't generate a response. Please try rephrasing."
+    
+    # Check for error indicators
+    error_indicators = ["error:", "exception:", "failed", "traceback"]
+    if any(indicator in response.lower() for indicator in error_indicators):
+        logger.warning(f"Error detected in response: {response[:100]}")
+        return "I encountered an issue while processing your request. Please try a different question."
+    
+    # Truncate very long responses
+    if len(response) > 10000:
+        logger.warning(f"Response too long ({len(response)} chars), truncating")
+        response = response[:9500] + "\n\n[Response truncated due to length]"
+    
+    return response.strip()
+
+# Updated version using the validation helper
+@app.post("/send_message_IAM_validated")
+def send_message_validated(request: QueryRequest):
+    try:
+        logger.info(f"Processing request for user: {request.user}")
+        global last_conversation_IAM
+        
+        # Prepare conversation context
+        last_conversation_IAM = last_conversation_IAM[-2:]  # Keep recent context
+        messages = last_conversation_IAM + [{"role": "user", "content": request.query}]
+        
+        # Get response from bot
+        raw_response = bot.get_response(request.user, messages)
+        
+        # Validate and clean the response
+        response = validate_bot_response(raw_response, request.query)
+        
+        # Store interaction
+        store_db.store_query_response_IAM(request.user_id, request.query, response, "text")
+        
+        # Update conversation history
+        last_conversation_IAM.extend([
+            {"role": "user", "content": request.query},
+            {"role": "assistant", "content": response}
+        ])
+        last_conversation_IAM = last_conversation_IAM[-4:]  # Keep last 2 exchanges
+        
+        logger.info(f"Successfully processed request, response length: {len(response)}")
+        
+        return {"text": response, "graph_data": None, "type": "text"}
+        
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        fallback_response = "I'm experiencing technical difficulties. Please try again or contact support if the issue persists."
+        
+        return {"text": fallback_response, "graph_data": None, "type": "text"}
