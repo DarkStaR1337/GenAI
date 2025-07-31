@@ -7,6 +7,25 @@ from typing import Dict, Any, List, Union
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
 
+def ensure_json_serializable(obj):
+    """Ensure object is JSON serializable"""
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    elif isinstance(obj, (list, tuple)):
+        return [ensure_json_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {str(k): ensure_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient='records')
+    elif isinstance(obj, pd.Series):
+        return obj.tolist()
+    elif hasattr(obj, 'item'):  # numpy types
+        return obj.item()
+    elif hasattr(obj, 'tolist'):  # numpy arrays
+        return obj.tolist()
+    else:
+        return str(obj)
+
 # Initialize Bedrock client
 def get_bedrock_client():
     """
@@ -251,14 +270,15 @@ class GraphAgent:
         else:
             result_obj = result
         
+        # Convert to serializable format and ensure it's clean
         if isinstance(result_obj, (list, dict)):
-            graph_json = json.dumps(result_obj, indent=2)
+            graph_data = ensure_json_serializable(result_obj)
         elif isinstance(result_obj, pd.DataFrame):
-            graph_json = result_obj.to_json(orient='records', indent=2)
+            graph_data = ensure_json_serializable(result_obj.to_dict(orient='records'))
         else:
-            graph_json = "[]"
+            graph_data = []
         
-        return graph_json, chart_type
+        return graph_data, chart_type
 
 class CoordinatorAgent:
     def __init__(self, df: pd.DataFrame):
@@ -272,13 +292,13 @@ class CoordinatorAgent:
             graph_data, chart_type = self.graph_agent.handle(question)
             return {
                 "text": "",
-                "graph_data": graph_data,
-                "type": chart_type
+                "graph_data": ensure_json_serializable(graph_data),
+                "type": str(chart_type)
             }
         elif "chat" in qtype:
             chat_text = self.chat_agent.handle(question)
             return {
-                "text": chat_text,
+                "text": str(chat_text),
                 "graph_data": None,
                 "type": "text"
             }
@@ -296,6 +316,10 @@ def get_offenses_response_new(query: str) -> Dict[str, Any]:
     df = get_jubilent_offense()  # Replace this with your actual data loading function
     coordinator = CoordinatorAgent(df)
     response = coordinator.handle_query(query)
+    
+    # Ensure everything is JSON serializable
+    response = ensure_json_serializable(response)
+    
     return response
 
 # Example usage:
