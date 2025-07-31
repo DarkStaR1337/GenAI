@@ -7,25 +7,6 @@ from typing import Dict, Any, List, Union
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
 
-def ensure_json_serializable(obj):
-    """Ensure object is JSON serializable"""
-    if isinstance(obj, (str, int, float, bool, type(None))):
-        return obj
-    elif isinstance(obj, (list, tuple)):
-        return [ensure_json_serializable(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {str(k): ensure_json_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, pd.DataFrame):
-        return obj.to_dict(orient='records')
-    elif isinstance(obj, pd.Series):
-        return obj.tolist()
-    elif hasattr(obj, 'item'):  # numpy types
-        return obj.item()
-    elif hasattr(obj, 'tolist'):  # numpy arrays
-        return obj.tolist()
-    else:
-        return str(obj)
-
 # Initialize Bedrock client
 def get_bedrock_client():
     """
@@ -238,9 +219,14 @@ class ChatAgent:
         result = safe_run_pandas_code(code, self.df)
         result2 = chat_response_format(question, result)
         
-        # Format answer for display
+        # Format answer for display - handle datetime objects
         if isinstance(result2, pd.DataFrame):
-            return result2.head(100).to_string(index=False)
+            # Convert datetime columns to strings for display
+            df_display = result2.head(100).copy()
+            for col in df_display.columns:
+                if pd.api.types.is_datetime64_any_dtype(df_display[col]):
+                    df_display[col] = df_display[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+            return df_display.to_string(index=False)
         if isinstance(result2, pd.Series):
             return result2.to_string()
         if isinstance(result2, (str, int, float, list, dict)):
@@ -270,11 +256,19 @@ class GraphAgent:
         else:
             result_obj = result
         
-        # Convert to serializable format and ensure it's clean
+        # Convert to serializable format (return actual objects, not JSON strings)
         if isinstance(result_obj, (list, dict)):
-            graph_data = ensure_json_serializable(result_obj)
+            graph_data = result_obj
         elif isinstance(result_obj, pd.DataFrame):
-            graph_data = ensure_json_serializable(result_obj.to_dict(orient='records'))
+            # Convert datetime columns to strings before serialization
+            df_copy = result_obj.copy()
+            for col in df_copy.columns:
+                if pd.api.types.is_datetime64_any_dtype(df_copy[col]):
+                    df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+                elif df_copy[col].dtype == 'object':
+                    # Handle individual datetime objects in object columns
+                    df_copy[col] = df_copy[col].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if isinstance(x, (pd.Timestamp, datetime)) else x)
+            graph_data = df_copy.to_dict(orient='records')
         else:
             graph_data = []
         
@@ -292,13 +286,13 @@ class CoordinatorAgent:
             graph_data, chart_type = self.graph_agent.handle(question)
             return {
                 "text": "",
-                "graph_data": ensure_json_serializable(graph_data),
-                "type": str(chart_type)
+                "graph_data": graph_data,
+                "type": chart_type
             }
         elif "chat" in qtype:
             chat_text = self.chat_agent.handle(question)
             return {
-                "text": str(chat_text),
+                "text": chat_text,
                 "graph_data": None,
                 "type": "text"
             }
@@ -317,8 +311,14 @@ def get_offenses_response_new(query: str) -> Dict[str, Any]:
     coordinator = CoordinatorAgent(df)
     response = coordinator.handle_query(query)
     
-    # Ensure everything is JSON serializable
-    response = ensure_json_serializable(response)
+    # Convert graph_data to JSON string for database storage if needed
+    # Handle datetime serialization issues
+    if response["graph_data"] is not None:
+        try:
+            response["graph_data_json"] = json.dumps(response["graph_data"], default=str)
+        except Exception as e:
+            print(f"JSON serialization error: {e}")
+            response["graph_data_json"] = json.dumps([], default=str)
     
     return response
 
