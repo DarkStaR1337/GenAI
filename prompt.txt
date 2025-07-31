@@ -1,350 +1,306 @@
-import sqlite3
+import pandas as pd
 import json
-import requests
+import ast
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Union
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
-from typing import List, Dict, Any
 
-# Your existing database functions remain the same
-def get_auth_token():
-    auth_payload = {"username": "USERNAME", "password": "PASSWORD"}
-    response = requests.post("API_URL_AUTH", json=auth_payload)
-    response_data = response.json()
-    return response_data.get("access_token")
-
-def check_app_ownership(user):
-    conn = sqlite3.connect(r"IAM/analytics.db")
-    try:
-        apps = []
-        query = "SELECT * FROM app_owner_info WHERE OwnerUserID = ?"
-        result = conn.execute(query, (user,)).fetchall()
-        if result:
-            apps = [item[3] for item in result]
-        return apps
-    except Exception as e:
-        print(f"Error checking request ownership: {e}")
-        return False
-    finally:
-        conn.close()
-
-def get_app_dormant_or_orphan_status(query, user):
-    conn = sqlite3.connect(r"IAM/analytics.db")
-    try:
-        apps = check_app_ownership(user)
-        if apps:
-            apps_str = "', '".join(apps)
-            if 'dormant_account_report' in query:
-                if 'WHERE' in query:
-                    query += f" AND AppName IN ('{apps_str}')"
-                else:
-                    query += f" WHERE AppName IN ('{apps_str}')"
-            elif 'application_orphan_account' in query:
-                if 'WHERE' in query:
-                    query += f" AND ApplicationName IN ('{apps_str}')"
-                else:
-                    query += f" WHERE ApplicationName IN ('{apps_str}')"
-            
-            results = conn.execute(query).fetchall()
-            if not results and ('app_access_info' in query or 'reportee_access_info' in query or 'access_request' in query):
-                return "Sorry, you don't have access to this information."
-            else:
-                return str(results)
-    except Exception as e:
-        return f"Query failed with error: {e}"
-    finally:
-        conn.close()
-
-def check_request_ownership(user, req_id):
-    conn = sqlite3.connect(r"IAM/analytics.db")
-    try:
-        query = f"SELECT * FROM access_request WHERE RequestID = ? AND RequestedBy = ?"
-        result = conn.execute(query, (req_id, user)).fetchone()
-        if result:
-            return result
-    except Exception as e:
-        print(f"Error checking request ownership: {e}")
-        return False
-    finally:
-        conn.close()
-
-def get_access_request_status(req_id, user):
-    res = check_request_ownership(user, req_id)
-    if res:
-        auth_token = get_auth_token()
-        headers = {"Authorization": f"Bearer {auth_token}"}
-        payload = {
-            "analyticsId": "1652",
-            "attributes": {
-                "reqID": req_id
-            }
-        }
-        
-        response = requests.post("API_URL_DATA", headers=headers, json=payload)
-        data = response.json()
-        
-        if data and data.get('results'):
-            if all(not value for value in data['results'][0].values()):
-                auth_token = get_auth_token()
-                headers = {"Authorization": f"Bearer {auth_token}"}
-                payload = {
-                    "analyticsId": "1652",
-                    "attributes": {
-                        "reqID": req_id
-                    }
-                }
-                url = ""
-                response = requests.post(url, headers=headers, json=payload)
-                data_new = response.json()
-                if data_new and data_new.get('result'):
-                    if all(not value for value in data_new['result'][0].values()):
-                        return "NO Data Found"
-                    else:
-                        data_new['result'][0]['status'] = res[4]
-                        return json.dumps(data_new)
-            else:
-                data['status'] = res[4]
-                return json.dumps(data)
-        else:
-            return "NO Data Found"
-    else:
-        return "You are not authorized to view this request status."
-
-def get_iam_data(query):
-    conn = sqlite3.connect("analytics.db")
-    try:
-        results = str(conn.execute(query).fetchall())
-    except Exception as e:
-        results = f"Query failed with error: {e}"
-    finally:
-        conn.close()
-    return results
-
-def get_iam_data_with_user_filter(query, user):
-    conn = sqlite3.connect(r"IAM/analytics.db")
-    try:
-        # Check if certain tables are in the query, and if so, append the appropriate WHERE clause
-        if 'app_access_info' in query:
-            if 'WHERE' in query:
-                query = query + f" AND (UserID = '{user}' OR OwnerUserID = '{user}')"
-            else:
-                query = query + f" WHERE (UserID = '{user}' OR OwnerUserID = '{user}')"
-        if 'reportee_access_info' in query:
-            if 'WHERE' in query:
-                query = query + f" AND (UserID = '{user}' OR ManagerUserID = '{user}')"
-            else:
-                query = query + f" WHERE (UserID = '{user}' OR ManagerUserID = '{user}')"
-        if 'access_request' in query:
-            if 'WHERE' in query:
-                query = query + f" AND (RequestedBy = '{user}')"
-            else:
-                query = query + f" WHERE (RequestedBy = '{user}')"
-        
-        results = conn.execute(query).fetchall()
-        if not results and ('app_access_info' in query or 'reportee_access_info' in query or 'access_request' in query):
-            return "Sorry, you don't have access to this information."
-        else:
-            return str(results)
-    except Exception as e:
-        return f"Query failed with error: {e}"
-    finally:
-        conn.close()
-
-# Define tools using LangChain's @tool decorator
-@tool
-def get_iam_data_tool(query: str) -> str:
-    """Useful for getting Identity Access Management (IAM) data from a SQLite database containing IAM access information. The input should be a SQL query to get the required information from an IAM SQLite database, based on the user's question.
-    Do not filter for active users unless specified by the user. SQL query must be in accordance to the below table information (table_description)."""
-    return get_iam_data(query)
-
-@tool
-def get_access_request_status_tool(req_id: str) -> str:
-    """Useful for getting the request details of an access request for a single request ID."""
-    # Note: We'll need to pass the user context somehow - see modification below
-    return "Tool requires user context - see modified version below"
-
-@tool
-def get_app_dormant_or_orphan_status_tool(query: str) -> str:
-    """Useful for getting the dormant or orphan accounts of applications owned by a specific user."""
-    # Note: We'll need to pass the user context somehow - see modification below
-    return "Tool requires user context - see modified version below"
-
-# Initialize Bedrock Chat model
-def initialize_bedrock_client():
-    """Initialize the Bedrock client with AWS Nova Lite model"""
-    from langchain_aws import ChatBedrockConverse
-    
-    chat = ChatBedrockConverse(
-        model="amazon.nova-lite-v1:0",  # AWS Nova Lite model
-        region_name="us-east-1",  # your AWS region
-        # Optional parameters for Nova Lite
+# Initialize Bedrock client
+def get_bedrock_client():
+    """
+    Initialize the ChatBedrockConverse client
+    Make sure to configure AWS credentials via:
+    - AWS CLI: aws configure
+    - Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+    - IAM roles (recommended for production)
+    """
+    return ChatBedrockConverse(
+        model_id="anthropic.claude-3-sonnet-20240229-v1:0",  # or use claude-3-haiku for faster responses
+        region_name="us-east-1",  # Change to your preferred region
         model_kwargs={
-            "max_tokens": 4096,
-            "temperature": 0.1,  # Lower temperature for more consistent responses
-            "top_p": 0.9
+            "max_tokens": 1000,
+            "temperature": 0.15
         }
-        # AWS credentials will be picked up from environment variables, IAM roles, or AWS config
     )
-    return chat
 
-def get_response(user, messages):
-    # Your existing system prompt
-    system_prompt = f"""
-    You are a helpful assistant that helps the user get information on Identity Access Management (IAM).
-    Understand the user's query, then use the available tools to get the required information. The current userID
-    is '{user}'.
-    The user query is: {messages[-1]['content']}.
-    Use the user's query along with the history of the last conversation to reference data only, nothing else.
-    The table descriptions are as follows for get_iam_data(): {{table_description}}.
-    Use these descriptions to correlate column names for answering the user's question.
+def date_now():
+    """Get current date plus 5 hours 30 minutes formatted as %d-%b-%Y"""
+    date = datetime.now()
+    ist_now = date + timedelta(hours=5, minutes=30)
+    formatted_date = ist_now.strftime("%d-%b-%Y")
+    return formatted_date
 
-    Instructions:
-    1. When creating a query with AppName, use AppName LIKE '%....%' instead of AppName='...'.
-    2. If there are 2 records for the same first name, also check the last name. Provide answers according to the user's question.
-    3. If the user query includes a Request Id, call get_access_request_status().
-    4. If the user asks for Dormant and/or Orphan accounts, call get_app_dormant_or_orphan_status().
-    5. Understand the user query and, if necessary, make multiple tool calls to the same or different function.
-    6. If the user requests data in a tabular format, provide the final response as a markdown string for the tabular data.
-    7. Understand the user query completely and answer appropriately, consistently, and completely to all subparts (if any).
-    8. Do not reveal the SQL query or internal processing in the final response. Never if necessary and always provide the correct response.
-    9. When asked for the status of a request, consider the column "TaskStatus" or "AccountStatus" not "Status".
-    10. Do not return columns that are not necessary for the user's query.
-    11. Provide maximum relevant details.
-    12. If fetching a list of users, run two tool calls: the first for fetching the complete records without limiting and the second for the total number of rows. Then return both results.
-    13. Do not add "%" in the queries created.
-    14. No Unions make two tool calls if required from two separate tables because column names are different.
-    15. Be consistent with your answers and do not hallucinate.
-    16. When asked for "orphan or dormant accounts" make two tool calls, one for dormant one for orphan and do not put any check/filter in the query.
-    17. When asked for managers's status, make two tool calls, one for finding who is the manager and one for finding the status for the manager name.
-    18. Retry if necessary internally but do not give incomplete answers.Do not generate final answer with information that is not required.
-    19. Be consistent with your answers and do not hallucinate.
-    20. When asked for reportees. Return only the reportees with active status.
+def bedrock_call(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
     """
-
-    # Initialize Bedrock client
-    chat = initialize_bedrock_client()
-    
-    # Create tools list - we need to modify this for user context
-    tools = [get_iam_data_tool]
-    
-    # For tools that need user context, we'll create them dynamically
-    @tool
-    def get_access_request_status_with_user(req_id: str) -> str:
-        """Useful for getting the request details of an access request for a single request ID."""
-        return get_access_request_status(req_id, user)
-    
-    @tool
-    def get_app_dormant_or_orphan_status_with_user(query: str) -> str:
-        """Useful for getting the dormant or orphan accounts of applications owned by a specific user."""
-        return get_app_dormant_or_orphan_status(query, user)
-    
-    tools.extend([get_access_request_status_with_user, get_app_dormant_or_orphan_status_with_user])
-    
-    # Bind tools to the chat model
-    chat_with_tools = chat.bind_tools(tools)
-    
-    # Convert your message format to LangChain format
-    langchain_messages = []
-    
-    # Add system message
-    langchain_messages.append(SystemMessage(content=system_prompt))
-    
-    # Convert conversation history
-    for msg in messages:
-        if msg.get("role") == "human" or msg.get("role") == "user":
-            langchain_messages.append(HumanMessage(content=msg["content"]))
-        # Note: Assistant messages and tool results will be handled by the chain
-    
-    # Get the latest user message
-    latest_message = messages[-1]["content"]
-    
-    # Invoke the model with tools
+    Call AWS Bedrock with the given prompt using LangChain ChatBedrockConverse
+    """
     try:
-        response = chat_with_tools.invoke(langchain_messages)
+        client = get_bedrock_client()
         
-        # Handle tool calls if present
-        if response.tool_calls:
-            # Execute tool calls
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                
-                # Find and execute the appropriate tool
-                for tool in tools:
-                    if tool.name == tool_name:
-                        try:
-                            tool_result = tool.invoke(tool_args)
-                            # You might want to store this result and continue the conversation
-                            # For now, we'll just include it in a follow-up call
-                        except Exception as e:
-                            tool_result = f"Error executing tool: {e}"
-                        break
-                
-                # Add tool result to messages and call model again
-                langchain_messages.append(response)
-                # Add tool result message (this depends on your specific tool calling implementation)
-                
-            # Make another call with tool results
-            final_response = chat_with_tools.invoke(langchain_messages)
-            return final_response.content
-        else:
-            return response.content
-            
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=prompt)
+        ]
+        
+        response = client.invoke(messages)
+        return response.content.strip()
+        
     except Exception as e:
-        return f"Error generating response: {e}"
+        return "Sorry, I can only answer offense related questions."
 
-# Alternative approach using LangChain's tool calling agent (Recommended)
-def get_response_with_agent(user, messages):
-    from langchain.agents import create_tool_calling_agent, AgentExecutor
-    from langchain_core.prompts import ChatPromptTemplate
-    
-    # Your system prompt
-    system_prompt = f"""
-    You are a helpful assistant that helps the user get information on Identity Access Management (IAM).
-    The current userID is '{user}'.
-    [Include all your existing instructions here]
+def chat_response_format(query: str, result: Any) -> str:
     """
+    Format chat response - same logic as original
+    """
+    prompt = f"""
+You are given a user query: {query}
+
+- The user input received may be a single record or a single word, as long as it answers the user query do not modify it.
+- The user input you receive comes from a data frame. Carefully restructure the result to answer the user's query.
+- Do not change dates if present.
+- Do not add, generate, or categorize any additional information.
+- Restructure the provided result to directly answer the user query in clear, natural language.
+- Do not modify or remove any of the given information; only restructure the user input.
+- Format the response in a user-friendly style, such as bullet points or numbered lists.
+- If there are 30 records in the user input and the total count, present the records as a numbered list and specify the total number of records.
+- If any error message appears in the user input, respond only with: "Sorry, try again."
+- If the user input is empty, respond only with: "There is no data for this query."
+- Ensure your answers are always consistent in style and approach.
+"""
     
-    # Create prompt template
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ])
+    if isinstance(result, pd.DataFrame):
+        res = result.to_json(orient='records')
+    elif isinstance(result, pd.Series):
+        res = '\n'.join(result.astype(str))
+    elif not isinstance(result, str):
+        res = str(result)
+    else:
+        res = result
     
-    # Initialize BedrockConverse client
-    chat = initialize_bedrock_client()
+    return bedrock_call(res, system_prompt=prompt)
+
+def classify_question(question: str) -> str:
+    """
+    Classify question as 'chat' or 'graph' - same logic as original
+    """
+    graph_keywords = ["chart", "plot", "graph", "chart", "draw", "visualize", "visualise"]
+    for keyword in graph_keywords:
+        if keyword in question.lower():
+            return "graph"
+    return "chat"
+
+def determine_chart_type_bedrock(question: str) -> str:
+    """
+    Determine chart type using Bedrock instead of GPT-4
+    """
+    chart_system_prompt = """
+You are a data visualization assistant.
+Given only the user's question, respond with ONLY ONE WORD:
+"bar", "pie", or "trendline", whichever is most appropriate for visualizing data relevant to the question.
+If the user asks about counts or comparison by category, use "bar".
+If the user asks for proportions or distribution, use "pie".
+Reply with only the chart type. Do not explain.
+"""
     
-    # Create tools with user context
-    @tool
-    def get_access_request_status_with_user(req_id: str) -> str:
-        """Useful for getting the request details of an access request for a single request ID."""
-        return get_access_request_status(req_id, user)
+    prompt = f"Question: {question}\nChart type:"
+    chart_type = bedrock_call(prompt, system_prompt=chart_system_prompt)
     
-    @tool
-    def get_app_dormant_or_orphan_status_with_user(query: str) -> str:
-        """Useful for getting the dormant or orphan accounts of applications owned by a specific user."""
-        return get_app_dormant_or_orphan_status(query, user)
+    # Normalize and validate output
+    chart_type = chart_type.lower().strip()
+    if chart_type not in ["bar", "pie", "trendline"]:
+        chart_type = "bar"
     
-    tools = [get_iam_data_tool, get_access_request_status_with_user, get_app_dormant_or_orphan_status_with_user]
+    return chart_type
+
+def strip_imports(code: str) -> str:
+    """
+    Remove lines starting with 'import' or 'from ... import ...' from the code.
+    """
+    lines = code.split('\n')
+    filtered = [line for line in lines if not line.strip().startswith('import') and not line.strip().startswith('from ')]
+    return '\n'.join(filtered)
+
+def extract_entities_and_code(question: str, df_columns: List[str], question_type: str) -> str:
+    """
+    Generate pandas code using Bedrock - same comprehensive prompt as original
+    """
+    schema = "\n".join(f"- {col}" for col in df_columns)
     
-    # Create agent
-    agent = create_tool_calling_agent(chat, tools, prompt)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    prompt = f"""
+Question type: {question_type}
+DataFrame schema:
+{schema}
+
+Instruction:
+Generate safe, robust pandas code to answer this question:
+
+Question: {question}
+
+Requirements:
+- Use the DataFrame named 'df'
+- In the generated python code, always assign the final output to a variable named result and ensure the last line is: result
+- Understand when user is asking 2 questions together and answer them separately.
+- Check data type before making python code and make the correct codes.
+- For count only give the count. List should only be returned if asked for it.
+- When filtering or aggregating by date or time for any offense (for trends, date range, etc), ALWAYS use the "start_time" column, unless the question specifically asks for a different date column.
+- If filtering by date, assume date columns are in '%d-%b-%Y' format; use pd.to_datetime as needed
+- If asked for only a particular column, Then result should be the unique values for the column only.
+- For columns "source_address_ids", "destination_methods", "categories", "local_destination_address_ids" are lists. Therefore, Create correct python code accordingly.
+- In case there are more than 30 records in the result dataframe, return top 30 and total length of the result dataframe.
+- For columns "rules", "log_sources": Each record is a list of dictionaries, .explode() creates pandas Series.Therefore, Create correct python code accordingly.use list comprehension to get unique values as a string
+- For column "rules" and "log_sources": 
+- Each record is a list of dictionaries.
+- To get unique dictionaries, after '.explode()', filter with 'isinstance(x, dict)'.
+- Since '.unique()' doesn't work on dicts, use 'import json' and apply 'json.dumps(d, sort_keys=True)' to each dict to get unique values (as strings), then use 'json.loads()' back to dict if needed.
+- Expectation is to have the consistent fields: description, categories, created_time, assigned_to, status if offense is OPEN/CLOSED' then Closure_time and the Closure_code while calculating average or mean time, specify and return the unit.
+- For Details/Summary for a particular month, week, or custom date range, provide a top-level summary of the offense trend for that period, which should include: Total offenses, Open offenses, Closed offenses, Breakdown of offenses by severity, Breakdown of offenses by closure code.
+- For week-based queries within a month (e.g., 'first week of June'), define weeks as follows: 1st week: 1st to 7th, 2nd week: 8th to 14th, 3rd week: 15th to 21st, 4th week: 22nd to 28th, 5th week: 29th to end of the month (inclusive).
+- Understand timeframe queries (yesterday/last day, today, last month, last week, last 24 hours, last to x days, name of the month, etc.) precisely.
+- If the query is irrelevant to the DataFrame, respond: "Sorry, I can only help with queries related to offenses."
+- If the query asks for the 'How' or 'procedure', respond: "Sorry, cannot help you with this."
+- never display time in epoch. Always in IST.
+- Current date is: {date_now()}
+- Code (do not explain):
+
+severity: ['Medium Severity', 'High Severity', 'Low Severity','Critical Severity']
+closing_reason_id: ['Benign True Positive','True Positive','False Positive','Policy Violation','Non-issue','No Response Received']
+If the answer is a table or summary, assign it to a variable named result.
+if question type is graph, output 'result' as a list of dicts: [{{"category": string, "value": int}}]. The keys should be constant "category" and "value". Categories when asked for top offenses consider the 'description' column.
+Never use print() or display().
+Be consistent with answers even if the question type or question formation or the type of graph in the question changes. Focus on the information required.
+Do NOT use dangerous methods or anything but pandas and Python. Give the proper python code.
+Do NOT execute the code. Just output the code string.
+Keep the code minimal and correct and simple and straightforward. Be consistent with the code created. Even if same question is asked in a different way.
+If the keyword 'last' is used (like 'last 7 days', 'last week'), EXCLUDE today from the range; select data from (today - N days) up to (but not including) today.
+Last 5 days means last 5 calendar days immediately preceding today, excluding today.
+Last month is the last month from current month. Last 30 days is the last 30 days from today but excluding today.
+Last week is the previous Monday to Sunday (excluding this week's Monday onward).
+Last 7 days is the last 7 days before today but excluding today.
+'Closed offenses' are the same as 'offenses with status closed'.
+For Details/Summary for a particular month provide a top level summary of the offense trend for that month which should include: Total offenses, Open offenses, Closed offenses by severity, Breakdown of offenses by closure code.
+# For Details/Summary for a particular month, week, or custom date range, provide a top-level summary of the offense trend for that period,
+# which should include: Total offenses, Open offenses, Closed offenses, Breakdown of offenses by severity, Breakdown of offenses by closure code.
+"""
     
-    # Get latest user message
-    latest_message = messages[-1]["content"]
+    code = bedrock_call(prompt)
+    code = code.replace("```python", "").replace("```", "")
+    return code
+
+def safe_run_pandas_code(code: str, df: pd.DataFrame) -> Any:
+    """
+    Run the generated pandas code in a controlled environment - same as original
+    """
+    code = strip_imports(code)
+    print(code)
+    safe_locals = {
+        "df": df.copy(), 
+        "pd": pd, 
+        "datetime": datetime, 
+        "timedelta": timedelta, 
+        "json": json
+    }
     
     try:
-        result = agent_executor.invoke({"input": latest_message})
-        return result["output"]
+        exec(code, safe_locals)
+        return safe_locals["result"]
     except Exception as e:
-        return f"Error generating response: {e}"
+        traceback.print_exc()
+        return f"Error running generated code: {e}"
 
-# Example usage (keeping the same interface as your original function)
-def main():
-    user = "test_user"
-    messages = [{"role": "user", "content": "Show me all access requests"}]
+class ChatAgent:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy()
     
-    response = get_response(user, messages)
-    print(response)
+    def handle(self, question: str) -> str:
+        df_cols = self.df.columns.tolist()
+        code = extract_entities_and_code(question, df_cols, question_type="chat")
+        result = safe_run_pandas_code(code, self.df)
+        result2 = chat_response_format(question, result)
+        
+        # Format answer for display
+        if isinstance(result2, pd.DataFrame):
+            return result2.head(100).to_string(index=False)
+        if isinstance(result2, pd.Series):
+            return result2.to_string()
+        if isinstance(result2, (str, int, float, list, dict)):
+            return str(result2)
+        return "No results or unrecognized output."
+
+class GraphAgent:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy()
+    
+    def handle(self, question: str) -> tuple:
+        df_cols = self.df.columns.tolist()
+        chart_type = determine_chart_type_bedrock(question)
+        
+        for word in ['bar', 'graph', 'pie', 'chart']:
+            question = question.lower().replace(word, '')
+        
+        code = extract_entities_and_code(question, df_cols, question_type="graph")
+        result = safe_run_pandas_code(code, self.df)
+        
+        # Always output as a JSON array of objects [{"category": ..., "value": ...}]
+        if isinstance(result, str):
+            try:
+                result_obj = ast.literal_eval(result)
+            except Exception:
+                result_obj = result
+        else:
+            result_obj = result
+        
+        if isinstance(result_obj, (list, dict)):
+            graph_json = json.dumps(result_obj, indent=2)
+        elif isinstance(result_obj, pd.DataFrame):
+            graph_json = result_obj.to_json(orient='records', indent=2)
+        else:
+            graph_json = "[]"
+        
+        return graph_json, chart_type
+
+class CoordinatorAgent:
+    def __init__(self, df: pd.DataFrame):
+        self.chat_agent = ChatAgent(df)
+        self.graph_agent = GraphAgent(df)
+    
+    def handle_query(self, question: str) -> Dict[str, Any]:
+        qtype = classify_question(question)
+        
+        if "graph" in qtype:
+            graph_data, chart_type = self.graph_agent.handle(question)
+            return {
+                "text": "",
+                "graph_data": graph_data,
+                "type": chart_type
+            }
+        elif "chat" in qtype:
+            chat_text = self.chat_agent.handle(question)
+            return {
+                "text": chat_text,
+                "graph_data": None,
+                "type": "text"
+            }
+        else:
+            return {
+                "text": "Sorry, could not determine your question.",
+                "graph_data": None,
+                "type": "text"
+            }
+
+def get_offenses_response_new(query: str) -> Dict[str, Any]:
+    """
+    Main function to get response - replace get_jubilent_offense() with your data loading function
+    """
+    df = get_jubilent_offense()  # Replace this with your actual data loading function
+    coordinator = CoordinatorAgent(df)
+    response = coordinator.handle_query(query)
+    return response
+
+# Example usage:
+if __name__ == "__main__":
+    # Example of how to use the system
+    query = "Show me the top 5 offenses by count"
+    response = get_offenses_response_new(query)
+    print(json.dumps(response, indent=2))
