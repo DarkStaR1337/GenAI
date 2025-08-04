@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
 def graph_query(query):
     """Check if query contains graph-related keywords"""
@@ -40,11 +42,6 @@ def graph_json(user_query, df, db_name):
         dburi = f"sqlite:///{db_name}"
         
         # Initialize AWS Bedrock chat model
-        # langchain-aws handles AWS authentication automatically
-        # Make sure you have AWS credentials configured via:
-        # - AWS CLI: aws configure
-        # - Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
-        # - IAM roles (if running on EC2)
         chat_model = ChatBedrockConverse(
             model="amazon.nova-lite-v1:0",
             region_name="us-east-1",  # Change to your preferred region
@@ -52,7 +49,14 @@ def graph_json(user_query, df, db_name):
             max_tokens=1000,
         )
         
-        # Create the prompt template
+        # Create SQL generation chain
+        sql_prompt = PromptTemplate.from_template(
+            "Simplify the above question, to create a correct SQL query. "
+            "Remove extra information which is not needed for an SQL query. "
+            "Just return the SQL query without any additional text.\n\nQuestion: {question}"
+        )
+        
+        # Create the answer prompt template
         answer_prompt = PromptTemplate.from_template("""
 Given the following user question, corresponding SQL query, and SQL result, answer the user question.
 If the SQLResult is empty, the Answer should be "No Data Found".
@@ -64,45 +68,27 @@ SQL Result: {result}
 Answer:
 """)
         
-        # Create a chain using LangChain's new approach
-        def create_chain():
-            def chain_func(inputs):
-                # Create SQL query using Bedrock
-                sql_system_message = SystemMessage(content="""Simplify the above question, to create an correct SQL query. 
-Remove extra information which is not needed for an SQL query. Just return the SQL query without any additional text.""")
-                
-                sql_user_message = HumanMessage(content=inputs["question"])
-                
-                sql_response = chat_model.invoke([sql_system_message, sql_user_message])
-                sql_query = sql_response.content.strip()
-                
-                # Execute the SQL query (you'll need to implement execute_query function)
-                try:
-                    # Connect to database and execute query
-                    con = sqlite3.connect(db_name)
-                    result = pd.read_sql_query(sql_query, con)
-                    con.close()
-                    query_result = result.to_dict('records') if not result.empty else []
-                except Exception as e:
-                    query_result = f"SQL Error: {str(e)}"
-                
-                # Generate final answer
-                final_prompt = answer_prompt.format(
-                    question=inputs["question"],
-                    query=sql_query,
-                    result=query_result
-                )
-                
-                final_message = HumanMessage(content=final_prompt)
-                final_response = chat_model.invoke([final_message])
-                
-                return {"output": final_response.content}
-            
-            return chain_func
+        # Create the chain using RunnablePassthrough
+        def execute_query(inputs):
+            """Execute SQL query and return results"""
+            try:
+                con = sqlite3.connect(db_name)
+                result = pd.read_sql_query(inputs["query"], con)
+                con.close()
+                return result.to_dict('records') if not result.empty else []
+            except Exception as e:
+                return f"SQL Error: {str(e)}"
         
-        chain = create_chain()
+        chain = (
+            RunnablePassthrough.assign(query=sql_prompt | chat_model | StrOutputParser())
+            .assign(result=lambda x: execute_query(x))
+            | answer_prompt
+            | chat_model
+            | StrOutputParser()
+        )
+        
         response = chain.invoke({"question": user_query})
-        return response["output"]
+        return response
         
     except Exception as e:
         raise Exception(status_code=500, detail=str(e))
@@ -240,16 +226,22 @@ Current date is: {date_now()}
                 region_name="us-east-1",
             )
             
-            # Create system message with the custom prompt
-            system_message = SystemMessage(content=custom_prompt_off.format(date_now=datetime.now))
-            user_message = HumanMessage(content=query)
+            # Create prompt and chain for general queries
+            prompt = PromptTemplate.from_template(
+                "{system_prompt}\n\nUser Query: {query}"
+            )
             
-            result = chat_model.invoke([system_message, user_message])
+            chain = prompt | chat_model | StrOutputParser()
             
-            if "execution environment" in result.content:
+            result_content = chain.invoke({
+                "system_prompt": custom_prompt_off.format(date_now=datetime.now),
+                "query": query
+            })
+            
+            if "execution environment" in result_content:
                 return {"text": "An error occurred. Please refresh the page and try again", "graph_data": None, "type": "text"}
             else:
-                return {"text": result.content, "graph_data": None, "type": "text"}
+                return {"text": result_content, "graph_data": None, "type": "text"}
                 
         except Exception as e:
             print(f"Error: {e}")
@@ -267,14 +259,17 @@ Remove extra information which is not needed for an SQL query. Just return the S
             region_name="us-east-1",
         )
         
-        # Create messages for SQL generation
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=query)
-        ]
+        # Create prompt for SQL generation
+        sql_prompt = PromptTemplate.from_template(
+            "Simplify the above question, to create a correct SQL query. "
+            "Remove extra information which is not needed for an SQL query. "
+            "Just return the SQL query without any additional text.\n\nQuestion: {content}"
+        )
         
-        response = chat_model.invoke(messages)
-        response_message = response.content
+        # Create the chain
+        chain = sql_prompt | chat_model | StrOutputParser()
+        
+        response_message = chain.invoke({"content": query})
         
         # Process the SQL and generate graph data
         amcharts_data = graph_json(response_message, df_offenses, db_name)
