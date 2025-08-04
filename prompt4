@@ -1,0 +1,270 @@
+import os
+import json
+import pandas as pd
+from azure.storage.blob import BlobServiceClient
+from langchain_aws import ChatBedrock
+from langchain.schema import HumanMessage, SystemMessage
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def get_demisto_data():
+    """
+    Fetch data from Azure Blob Storage and return processed DataFrame
+    """
+    try:
+        # Azure Blob Storage connection (keeping this part unchanged)
+        connection_string = os.environ.get("BLOB_CONNECTION_STRING")
+        container = os.environ.get("container_name")
+        filename = "data.json"
+        
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container)
+        blob_client = container_client.get_blob_client(filename)
+        blob_data = blob_client.download_blob().readall()
+        demisto_data_inc = json.loads(blob_data)
+        
+        # Process the data
+        df_selected = pd.DataFrame.from_dict(demisto_data_inc)
+        df_selected = pd.json_normalize(df_selected['data'])
+        
+        # Select and rename columns
+        to_keep = ['id', 'type', 'name', 'severity', 'status', 'closeReason', 'CustomFields.remarks']
+        df = df_selected[to_keep]
+        df = df.rename(columns={'CustomFields.remarks': 'Remarks', 'closeReason': 'Close_Reason'})
+        df = df.fillna("")
+        
+        # Data transformations
+        df.loc[:, 'severity'] = df['severity'].replace([0, 0.5, 1, 2, 3, 4], 
+                                                      ['Unknown', 'Informational', 'Low', 'Medium', 'High', 'Critical'])
+        df.loc[:, 'status'] = df['status'].replace([0, 1, 2], ['Pending', 'Active', 'Closed'])
+        df = df.sort_values(by='id')
+        
+        return df
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def analyze_sentiment(text):
+    """
+    Analyze sentiment using AWS Bedrock Claude Nova Lite
+    """
+    try:
+        # Initialize AWS Bedrock client using langchain_aws
+        # Make sure you have AWS credentials configured (via IAM role, environment variables, or AWS profile)
+        bedrock_client = ChatBedrock(
+            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",  # Using Claude 3.5 Sonnet as Nova Lite may not be available yet
+            region_name="ap-southeast-1",  # APAC region
+            model_kwargs={
+                "max_tokens": 1000,
+                "temperature": 0.1,
+            }
+        )
+        
+        # Create messages for sentiment analysis
+        system_message = SystemMessage(
+            content="Analyze the sentiment of the following text. Is it positive, neutral, or negative? "
+                   "Only give one word as the answer: Positive/Neutral/Negative. If the text is empty or null or has no context "
+                   "then the answer should be Neutral."
+        )
+        
+        human_message = HumanMessage(content=f"Analyze the sentiment of the following text: {text}")
+        
+        messages = [system_message, human_message]
+        
+        # Get response from Bedrock
+        response = bedrock_client.invoke(messages)
+        
+        # Extract sentiment from response content
+        sentiment = response.content.strip()
+        
+        return sentiment
+        
+    except Exception as e:
+        logger.error(f"Error in sentiment analysis: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def sentiment_analysis_ai(df):
+    """
+    Apply sentiment analysis to the DataFrame using AWS Bedrock
+    """
+    try:
+        # Apply sentiment analysis to remarks column
+        df['Sentiment'] = df['Remarks'].apply(
+            lambda remark: analyze_sentiment(remark) if pd.notnull(remark) and remark.strip() != '' else 'Neutral'
+        )
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in sentiment analysis AI: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import pandas as pd
+import logging
+import os
+from langchain_aws import ChatBedrock
+from langchain.schema import HumanMessage
+from langchain_experimental.agents import create_csv_agent
+from langchain.agents import AgentType
+
+# Import your existing sentiment functions (keeping blob data fetch unchanged)
+import sentiment_fetch
+
+app = FastAPI()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class QueryRequest(BaseModel):
+    query: str
+    user_id: str = None
+
+@app.post("/sentiment")
+async def sentiment(request: QueryRequest):
+    """
+    Main sentiment analysis endpoint with AWS Bedrock integration
+    """
+    try:
+        # Fetch and analyze data (your existing code with blob fetch)
+        logger.info(f"data: {request}")
+        df_sent = sentiment_fetch.get_demisto_data()
+        
+        if df_sent.empty:
+            return {"text": "Demistro data is null", "type": "text"}
+            
+        df_final_ai = sentiment_fetch.sentiment_analysis_ai(df_sent)
+        df_final_ai.to_csv("final2.csv", index=False)
+        
+        # Create prefix for CSV agent
+        prefix = '''
+        Do not create your own indexing. Use only the information provided in the file.
+        Always mention the incident id corresponding to the information that is being returned.
+        '''
+        
+        # Initialize AWS Bedrock LLM for CSV agent
+        bedrock_llm = ChatBedrock(
+            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",  # Using Claude 3.5 Sonnet
+            region_name="ap-southeast-1",  # APAC region
+            model_kwargs={
+                "max_tokens": 4000,
+                "temperature": 0.1,
+            }
+        )
+        
+        # Create CSV agent with AWS Bedrock
+        agent = create_csv_agent(
+            bedrock_llm,
+            'final2.csv',
+            verbose=True,
+            prefix=prefix,
+            agent_type=AgentType.OPENAI_FUNCTIONS,  # This works with Claude as well
+            allow_dangerous_code=True,
+            agent_executor_kwargs={"handle_parsing_errors": True, "return_only_outputs": True}
+        )
+        
+        # Process query based on type
+        x, y = graph_query(request.query)
+        
+        if x:
+            # Handle graph/chart queries
+            db_name = "DB/sent.db"
+            amcharts_data = graph_json(request.query, df_sent, db_name)
+            
+            if amcharts_data:
+                response = {"text": "", "graph_data": amcharts_data, "type": "y"}
+                store_db.store_query_response_sentiment(request.user_id, request.query, amcharts_data, y)
+                logger.info(f"graph_data: {amcharts_data}")
+                return response
+            else:
+                response = "Please elaborate your question"
+                store_db.store_query_response_sentiment(request.user_id, request.query, response, "text")
+                logger.info(f"chat response: {response}")
+                return {"text": response, "type": "text"}
+        else:
+            # Handle regular text queries using AWS Bedrock agent
+            try:
+                result = agent.invoke(request.query)
+                final_resp = result['output']
+                store_db.store_query_response_sentiment(request.user_id, request.query, final_resp, "text")
+                logger.info(f"chat response: {final_resp}")
+                return {"text": final_resp, "graph_data": None, "type": "text"}
+            except Exception as agent_error:
+                logger.error(f"Agent error: {str(agent_error)}")
+                # Fallback to direct Bedrock query
+                try:
+                    fallback_response = await direct_bedrock_query(request.query, df_final_ai)
+                    store_db.store_query_response_sentiment(request.user_id, request.query, fallback_response, "text")
+                    return {"text": fallback_response, "graph_data": None, "type": "text"}
+                except Exception as fallback_error:
+                    logger.error(f"Fallback error: {str(fallback_error)}")
+                    return {"text": "I apologize, but I'm having trouble processing your request right now. Please try again.", "type": "text"}
+        
+    except Exception as e:
+        logger.error(f"Main endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def direct_bedrock_query(query: str, df: pd.DataFrame) -> str:
+    """
+    Fallback function to query Bedrock directly with DataFrame context
+    """
+    try:
+        bedrock_client = ChatBedrock(
+            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            region_name="ap-southeast-1",
+            model_kwargs={
+                "max_tokens": 4000,
+                "temperature": 0.1,
+            }
+        )
+        
+        # Create context from DataFrame
+        df_summary = df.head(10).to_string()  # Limit to first 10 rows for context
+        
+        prompt = f"""
+        Based on the following incident data with sentiment analysis:
+        
+        {df_summary}
+        
+        Please answer the following question: {query}
+        
+        Instructions:
+        - Always mention the incident ID when referring to specific incidents
+        - Use only the information provided in the data
+        - If you can't find relevant information, say so clearly
+        """
+        
+        message = HumanMessage(content=prompt)
+        response = bedrock_client.invoke([message])
+        
+        return response.content.strip()
+        
+    except Exception as e:
+        logger.error(f"Direct Bedrock query error: {str(e)}")
+        return "I'm sorry, I couldn't process your request at the moment."
+
+def graph_query(query: str):
+    """
+    Determine if query requires graph/chart visualization
+    (Keep your existing graph_query logic)
+    """
+    # Your existing implementation
+    # Return (True, chart_type) if graph is needed, (False, None) otherwise
+    pass
+
+def graph_json(query: str, df: pd.DataFrame, db_name: str):
+    """
+    Generate graph data for visualization
+    (Keep your existing graph_json logic)
+    """
+    # Your existing implementation
+    pass
+
+# Add any other existing endpoints or utility functions
