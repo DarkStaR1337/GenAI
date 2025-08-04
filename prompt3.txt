@@ -1,0 +1,294 @@
+import json
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+from langchain_aws import ChatBedrockConverse
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import PromptTemplate
+
+def graph_query(query):
+    """Check if query contains graph-related keywords"""
+    graph_keywords = ["bar", "pie", "graph", "chart", "draw", "visualize", "visualise"]
+    for keyword in graph_keywords:
+        if keyword in query.lower():
+            return True, keyword
+    return False, None
+
+def df_to_db(df, db_name):
+    """Convert DataFrame to SQLite database"""
+    try:
+        # Convert list columns to JSON strings
+        for col in df.columns:
+            if df[col].apply(lambda x: isinstance(x, list)).any():
+                df[col] = df[col].apply(json.dumps)
+        
+        # Create the connection to the database
+        con = sqlite3.connect(db_name)
+        try:
+            # Write the dataframe to the SQL table, replacing it if it already exists
+            df.to_sql("my_table", con, if_exists="replace", index=False)
+        finally:
+            # Ensure the connection is closed even if an exception occurs
+            con.close()
+    except Exception as e:
+        raise Exception(status_code=500, detail=str(e))
+
+def graph_json(user_query, df, db_name):
+    """Process queries and generate responses using AWS Bedrock"""
+    try:
+        df_to_db(df, db_name)
+        dburi = f"sqlite:///{db_name}"
+        
+        # Initialize AWS Bedrock chat model
+        # langchain-aws handles AWS authentication automatically
+        # Make sure you have AWS credentials configured via:
+        # - AWS CLI: aws configure
+        # - Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+        # - IAM roles (if running on EC2)
+        chat_model = ChatBedrockConverse(
+            model="amazon.nova-lite-v1:0",
+            region_name="us-east-1",  # Change to your preferred region
+            temperature=0.1,
+            max_tokens=1000,
+        )
+        
+        # Create the prompt template
+        answer_prompt = PromptTemplate.from_template("""
+Given the following user question, corresponding SQL query, and SQL result, answer the user question.
+If the SQLResult is empty, the Answer should be "No Data Found".
+The SQL Result should be always returned in form of two dimensions: a string-based category and a numeric value with corresponding axis name.
+Create a two dimensional JSON list each having category and value with the corresponding label. DO NOT ADD any extra content in the response.
+Question: {question}
+SQL Query: {query}
+SQL Result: {result}
+Answer:
+""")
+        
+        # Create a chain using LangChain's new approach
+        def create_chain():
+            def chain_func(inputs):
+                # Create SQL query using Bedrock
+                sql_system_message = SystemMessage(content="""Simplify the above question, to create an correct SQL query. 
+Remove extra information which is not needed for an SQL query. Just return the SQL query without any additional text.""")
+                
+                sql_user_message = HumanMessage(content=inputs["question"])
+                
+                sql_response = chat_model.invoke([sql_system_message, sql_user_message])
+                sql_query = sql_response.content.strip()
+                
+                # Execute the SQL query (you'll need to implement execute_query function)
+                try:
+                    # Connect to database and execute query
+                    con = sqlite3.connect(db_name)
+                    result = pd.read_sql_query(sql_query, con)
+                    con.close()
+                    query_result = result.to_dict('records') if not result.empty else []
+                except Exception as e:
+                    query_result = f"SQL Error: {str(e)}"
+                
+                # Generate final answer
+                final_prompt = answer_prompt.format(
+                    question=inputs["question"],
+                    query=sql_query,
+                    result=query_result
+                )
+                
+                final_message = HumanMessage(content=final_prompt)
+                final_response = chat_model.invoke([final_message])
+                
+                return {"output": final_response.content}
+            
+            return chain_func
+        
+        chain = create_chain()
+        response = chain.invoke({"question": user_query})
+        return response["output"]
+        
+    except Exception as e:
+        raise Exception(status_code=500, detail=str(e))
+
+def get_offenses_response(query):
+    """Main function to handle offense-related queries"""
+    
+    # Sample data setup (replace with your actual data loading)
+    # client = get_next_client()  # Your data client
+    # if client == "llm1":
+    #     llm = llm2
+    # else:
+    #     llm = llm3
+    # llm = llm2
+    
+    # Time-based filtering logic
+    dict1 = {
+        "last_day": "yesterday",
+        "last_week": "last 7 days",
+        "last_month": "last 30 days",
+    }
+    
+    # Load your offenses dataframe
+    # df_offenses = get_jubilent_offense()  # Your data loading function
+    # df_offenses = pd.read_excel("jubilent/offenses_start.xlsx")  # Example
+    
+    # For demo purposes, creating a sample DataFrame
+    # Replace this with your actual data loading logic
+    df_offenses = pd.DataFrame({
+        'id': range(1, 101),
+        'description': ['Sample offense ' + str(i) for i in range(1, 101)],
+        'status': ['OPEN'] * 50 + ['CLOSED'] * 50,
+        'start_time': pd.date_range('2024-01-01', periods=100, freq='D'),
+        'close_time': pd.date_range('2024-01-15', periods=100, freq='D'),
+        'severity': ['Low', 'Medium', 'High', 'Critical'] * 25,
+        'categories': [['network', 'security']] * 100,
+        'assigned_to': ['user' + str(i % 10) for i in range(100)]
+    })
+    
+    custom_prompt_off = """
+You are working with a Whole DataFrame containing various details about offenses. Some of the columns are:
+1. id: Unique identifier for the offense.
+2. description: Text description of the offense.
+3. status: Current status of the offense (e.g., OPEN, CLOSED).
+4. rules: List of rules (ID and type) related to the offense.
+5. assigned_to: Email/identifier of the person assigned to the offense.
+6. closing_user: Email/identifier of the user who closed the offense.
+7. close_time: Timestamp when the offense was closed(dd-month-year).
+8. start_time: Timestamp when the offense started(dd-month-year).
+9. magnitude: Severity of the offense.
+10. categories: List of categories under which the offense falls.
+11. severity: Severity level of the offense(Low severity, Medium severity, High severity, Critical severity).
+12. closing_reason_id: Identifier for the reason the offense was closed(Benign True Positive ,True Positive, False Positive, Non-Issue, No Response Received,Policy Violation).
+13. offense_type: Type of offense.
+14. relevance: Relevance score of the offense.
+When asked to provide information, ensure you consider all relevant columns and provide correct data.
+**Do not consider sample or dummy data on your own.**
+
+2. Examples:
+
+Question: "How many offenses occurred in the last week?"
+Thought: Filter the DataFrame for rows where 'start_time' is within the last 7 days.Filter the null values and Return the count of offenses.
+Action: Perform the filtering and counting, then return the result.
+
+Question:"Give me all details of offense id 28433"
+Thought: Filter the DataFrame for rows where 'id' is '28433'. Return the data in 'description','categories','assigned_to','start_time','close_time','magnitude','severity'.
+Action: Perform the filtering and counting, then return the result.
+
+Question: "Offenses created last week"
+Thought: Filter the DataFrame for rows where 'start_time' is of last 7 days. Return the offenses for that 7 days.
+Action: Perform the filtering and counting, then return the result.
+
+Question: "What is the average time to close an offense?"
+Thought: Filter the DataFrame for rows 'close_time'. Return the mean/average of the time in minutes.
+Action: Perform the filtering and counting, then return the result.
+
+Question: "Can you give the recipe for Pizza?"
+Thought: This question is irrelevant to the DataFrame. Respond appropriately.
+Final Answer: "Sorry, I can only help with queries related to offenses."
+
+3. GUIDELINES:
+Make proper python code with proper imports and run correctly. Return only the answer.
+ALWAYS query from the dataframe provided. There is no csv file or sample data.
+ALWAYS Follow the [dict1] for answering to the time frame queries.(last week, last month, last 3 days etc.)
+If the query mentions "last week" ALWAYS use the following: start_date_last_week = current_date - timedelta(days=7); end_date_last_week = current_date - timedelta(days=1).
+Filter null values and count the correct count.
+Expectation is to have the consistent fields description, categories, created time, assigned_to, status if offense is closed then closure time and the closure code as well.
+Understand the terms yesterday/last day, today, last week, last month. last 3 days, Rules of the month effectively. Example:- last 14 days=last 2 weeks.
+Do consider the similar dates for "time queries". Do NOT HALLUCINATE.
+Understand that(dd-month-year) precisely, while answering the user query.
+"Closed offenses" are same as "offenses with status closed".
+If the keyword "last" is there like, "last 7 days" or "last week" etc, then exclude today.
+Use ONLY "start_time" to calculate assigned and closed offenses within a specific time period, unless instructed differently.
+Keep this in mind while calculating : **Total offense=closed offenses+open offenses**
+If the required information is not in the DataFrame, respond with: "Sorry, I can only help with queries related to offenses."
+
+Do not repeat content in your answer.
+NEVER create data of your own.
+Do not respond in tabular format. Format your answer as a list.
+Be consistent with your answers.
+Do not return any code.
+Do not create column name.
+Current date is: {date_now()}
+"""
+    
+    # Check if query contains graph keywords
+    x, y = graph_query(query)
+    
+    if x:
+        db_name = "jubilent/offense.db"
+        amcharts_data = gen(query, df_offenses, db_name)
+        
+        if amcharts_data:
+            response = {
+                "text": "", 
+                "graph_data": amcharts_data, 
+                "type": "pie" if y == "visualize" else "bar"
+            }
+            # Further conditional logic for type setting
+            if y == "graph":
+                response["type"] = "bar"
+            elif y == "chart" or y == "draw":
+                response["type"] = "trendline"
+            
+            return response
+        else:
+            response = "Please elaborate your question"
+            return {"text": response, "type": "text"}
+    else:
+        # For non-graph queries, use Bedrock for general analysis
+        try:
+            # Initialize Bedrock model for general queries
+            chat_model = ChatBedrockConverse(
+                model="amazon.nova-lite-v1:0",
+                region_name="us-east-1",
+            )
+            
+            # Create system message with the custom prompt
+            system_message = SystemMessage(content=custom_prompt_off.format(date_now=datetime.now))
+            user_message = HumanMessage(content=query)
+            
+            result = chat_model.invoke([system_message, user_message])
+            
+            if "execution environment" in result.content:
+                return {"text": "An error occurred. Please refresh the page and try again", "graph_data": None, "type": "text"}
+            else:
+                return {"text": result.content, "graph_data": None, "type": "text"}
+                
+        except Exception as e:
+            print(f"Error: {e}")
+            return {"text": "An error occurred. Please refresh the page and try again", "graph_data": None, "type": "text"}
+
+def gen(query, df_offenses, db_name):
+    """Generate graph data using Bedrock"""
+    system_prompt = """Simplify the above question, to create an correct SQL query. 
+Remove extra information which is not needed for an SQL query. Just return the SQL query without any additional text."""
+    
+    try:
+        # Initialize Bedrock model
+        chat_model = ChatBedrockConverse(
+            model="amazon.nova-lite-v1:0",
+            region_name="us-east-1",
+        )
+        
+        # Create messages for SQL generation
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=query)
+        ]
+        
+        response = chat_model.invoke(messages)
+        response_message = response.content
+        
+        # Process the SQL and generate graph data
+        amcharts_data = graph_json(response_message, df_offenses, db_name)
+        return amcharts_data
+        
+    except Exception as e:
+        print(f"Error in gen function: {e}")
+        return None
+
+# Requirements for your requirements.txt file:
+"""
+langchain-aws>=0.1.0
+langchain-core>=0.1.0
+pandas>=1.5.0
+# Note: sqlite3 is included with Python standard library
+# langchain-aws handles AWS authentication internally, no need for boto3
+"""
