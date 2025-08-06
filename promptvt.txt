@@ -1,0 +1,237 @@
+import requests
+from langchain_aws import ChatBedrockConverse
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List
+import json
+
+# VirusTotal API functions (unchanged from your original code)
+def get_ip_report_from_virustotal(ip_address):
+    headers = {
+        "x-apikey": virustotal_api_key,
+        "Content-Type": "application/json"
+    }
+    response = requests.get(f"{virustotal_api_url}/ip_addresses/{ip_address}", headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return None
+
+def get_file_report_from_virustotal(hash_file):
+    headers = {
+        "x-apikey": virustotal_api_key,
+        "Content-Type": "application/json"
+    }
+    response = requests.get(f"{virustotal_api_url}/files/{hash_file}", headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return None
+
+def get_url_report_from_virustotal(url):
+    payload = {"url": url}
+    headers1 = {
+        "accept": "application/json",
+        "x-apikey": virustotal_api_key,
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    scan_url = requests.post(f"{virustotal_api_url}/urls", data=payload, headers=headers1)
+    print(scan_url.text)
+
+def get_subdomains_from_virustotal(domain):
+    # Implementation based on your original code
+    else:
+        return None
+
+def get_files_from_virustotal(domain):
+    headers = {
+        "x-apikey": virustotal_api_key,
+        "Content-Type": "application/json"
+    }
+    response = requests.get(f"{virustotal_api_url}/domains/{domain}/communicating_files", headers=headers)
+    
+    if response.status_code == 200:
+        report = response.json()
+        data = report["data"]
+        file_details_list = []
+        for file in data:
+            file_attributes = file["attributes"]
+            file_details = {
+                "file_hash": file.get("id"),
+                "file_name": file_attributes.get("names", ["Unknown"]),
+                "file_type": file_attributes.get("type_description", "Unknown"),
+                "file_size": file_attributes.get("size", "Unknown"),
+                "last_analysis_date": file_attributes.get("last_analysis_date", "Unknown"),
+                "detection": file_attributes.get("last_analysis_stats", {})
+            }
+            file_details_list.append(file_details)
+        
+        return file_details_list
+    else:
+        return None
+
+def get_dns_domain_from_virustotal(domain):
+    # Implementation based on your original code
+    pass
+
+# Define tools using Pydantic models for parameters
+class IPReportParams(BaseModel):
+    ip_address: str = Field(description="The IP address to query")
+
+class FileReportParams(BaseModel):
+    hash_file: str = Field(description="The file hash to query")
+
+class URLReportParams(BaseModel):
+    url: str = Field(description="The URL to query")
+
+class DomainParams(BaseModel):
+    domain: str = Field(description="The domain to query")
+
+# Define tools using langchain's @tool decorator
+@tool(args_schema=IPReportParams)
+def get_ip_report_from_virustotal_tool(ip_address: str) -> Optional[Dict[str, Any]]:
+    """Get the report for an IP address from VirusTotal"""
+    return get_ip_report_from_virustotal(ip_address)
+
+@tool(args_schema=FileReportParams)
+def get_file_report_from_virustotal_tool(hash_file: str) -> Optional[Dict[str, Any]]:
+    """Get the report for a file hash from VirusTotal"""
+    return get_file_report_from_virustotal(hash_file)
+
+@tool(args_schema=URLReportParams)
+def get_url_report_from_virustotal_tool(url: str) -> Optional[Dict[str, Any]]:
+    """Get the report for a URL from VirusTotal"""
+    return get_url_report_from_virustotal(url)
+
+@tool(args_schema=DomainParams)
+def get_subdomains_from_virustotal_tool(domain: str) -> Optional[Dict[str, Any]]:
+    """Get subdomains for a domain from VirusTotal"""
+    return get_subdomains_from_virustotal(domain)
+
+@tool(args_schema=DomainParams)
+def get_files_from_virustotal_tool(domain: str) -> Optional[List[Dict[str, Any]]]:
+    """Get communicating files for a domain from VirusTotal"""
+    return get_files_from_virustotal(domain)
+
+@tool(args_schema=DomainParams)
+def get_dns_domain_from_virustotal_tool(domain: str) -> Optional[Dict[str, Any]]:
+    """Get passive DNS resolutions for a domain from VirusTotal"""
+    return get_dns_domain_from_virustotal(domain)
+
+# Initialize ChatBedrockConverse
+def initialize_bedrock_client():
+    """Initialize the Bedrock client with your preferred model"""
+    return ChatBedrockConverse(
+        model="anthropic.claude-3-5-sonnet-20241022-v2:0",  # or any other supported model
+        region_name="us-east-1",  # specify your AWS region
+        # AWS credentials will be picked up from environment variables or IAM role
+    )
+
+# Main function to handle conversations with tools
+def generate_bedrock_response(messages: List[Dict[str, str]]) -> str:
+    """
+    Generate response using Bedrock with tool calling capabilities
+    
+    Args:
+        messages: List of message dictionaries with 'role' and 'content' keys
+    
+    Returns:
+        str: The response from the model
+    """
+    
+    # Initialize the Bedrock client
+    llm = initialize_bedrock_client()
+    
+    # Define available tools
+    tools = [
+        get_ip_report_from_virustotal_tool,
+        get_file_report_from_virustotal_tool,
+        get_url_report_from_virustotal_tool,
+        get_subdomains_from_virustotal_tool,
+        get_files_from_virustotal_tool,
+        get_dns_domain_from_virustotal_tool
+    ]
+    
+    # Bind tools to the model
+    llm_with_tools = llm.bind_tools(tools)
+    
+    # Convert messages to LangChain format
+    langchain_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            langchain_messages.append(SystemMessage(content=msg["content"]))
+        elif msg["role"] == "user":
+            langchain_messages.append(HumanMessage(content=msg["content"]))
+        # Note: Assistant messages would need to be handled differently if you have conversation history
+    
+    try:
+        # Get response from model
+        response = llm_with_tools.invoke(langchain_messages)
+        
+        # Handle tool calls if present
+        if response.tool_calls:
+            # Execute tool calls and get results
+            tool_messages = []
+            
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                tool_id = tool_call.get("id", "")
+                
+                # Find and execute the appropriate tool
+                tool_result = None
+                for tool in tools:
+                    if tool.name == tool_name:
+                        try:
+                            tool_result = tool.invoke(tool_args)
+                        except Exception as e:
+                            tool_result = f"Error executing tool: {str(e)}"
+                        break
+                
+                # Create tool message
+                from langchain_core.messages import ToolMessage
+                tool_messages.append(
+                    ToolMessage(
+                        content=json.dumps(tool_result) if tool_result else "No result",
+                        tool_call_id=tool_id
+                    )
+                )
+            
+            # Get final response with tool results
+            final_messages = langchain_messages + [response] + tool_messages
+            final_response = llm_with_tools.invoke(final_messages)
+            
+            return final_response.content
+        else:
+            # No tool calls, return direct response
+            return response.content
+            
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
+
+# Example usage function
+def example_usage():
+    """Example of how to use the new Bedrock-based system"""
+    
+    # Example messages (similar to your OpenAI format)
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a cybersecurity assistant that can analyze threats using VirusTotal. Use the available tools to help users with their security queries."
+        },
+        {
+            "role": "user", 
+            "content": "Can you check the reputation of IP address 8.8.8.8?"
+        }
+    ]
+    
+    response = generate_bedrock_response(messages)
+    print("Response:", response)
+
+# Configuration (you'll need to set these)
+virustotal_api_key = "YOUR_VIRUSTOTAL_API_KEY"
+virustotal_api_url = "https://www.virustotal.com/api/v3"
+
+if __name__ == "__main__":
+    example_usage()
