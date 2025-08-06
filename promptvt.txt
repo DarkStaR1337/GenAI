@@ -1,3 +1,266 @@
+# api.py - FastAPI endpoint file
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import logging
+import json
+from typing import List, Dict, Any
+
+# Import the AWS Bedrock functions from your aws_functions.py file
+from aws_functions import (
+    generate_bedrock_response,
+    initialize_bedrock_client,
+    get_ip_report_from_virustotal,
+    get_file_report_from_virustotal,
+    get_url_report_from_virustotal,
+    get_subdomains_from_virustotal,
+    get_files_from_virustotal,
+    get_dns_domain_from_virustotal,
+    # Import the tool functions
+    get_ip_report_from_virustotal_tool,
+    get_file_report_from_virustotal_tool,
+    get_url_report_from_virustotal_tool,
+    get_subdomains_from_virustotal_tool,
+    get_files_from_virustotal_tool,
+    get_dns_domain_from_virustotal_tool
+)
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# FastAPI app
+app = FastAPI(title="Cybersecurity Threat Analysis API", version="2.0.0")
+
+class QueryRequest(BaseModel):
+    user_id: str
+    query: str
+
+# Global conversation storage (in production, use a proper database)
+last_conversation = []
+
+# Simple conversation starters (same as your original)
+simple_conversation_starters = {
+    "hello": {"response": "Hello! How can I help you with cybersecurity analysis today?"},
+    "hi": {"response": "Hi there! I'm here to help you analyze potential threats using VirusTotal."},
+    "help": {"response": "I can help you analyze IPs, file hashes, URLs, and domains using VirusTotal. Just ask me to check something!"}
+}
+
+@app.post("/threat")
+async def analyze_query(request: QueryRequest):
+    """
+    Analyze cybersecurity threats using AWS Bedrock and VirusTotal
+    Simple implementation using the generate_bedrock_response function
+    """
+    global last_conversation
+    
+    print("client:", request)
+    print("type(client):", type(request))
+    
+    lower_query = request.query.lower()
+    logger.info(f"data: {request}")
+    
+    # Check for simple conversation starters
+    if lower_query in simple_conversation_starters:
+        predefined = simple_conversation_starters[lower_query]
+        response = predefined["response"]
+        return {"text": response, "type": "text"}
+    
+    else:
+        # Update the conversation history
+        last_conversation = last_conversation[-2:]  # Keep only the last conversation
+        # Append the current query to the last conversation
+        messages = last_conversation + [{"role": "user", "content": request.query}]
+        last_conversation = last_conversation + [{"role": "user", "content": request.query}]
+        
+        try:
+            # Generate response from AWS Bedrock (this handles tool calls internally)
+            response = generate_bedrock_response(messages)
+            final_answer = response
+            
+            # Store the response in conversation history
+            last_conversation.append({"role": "assistant", "content": final_answer})
+            last_conversation = last_conversation[-2:]  # Keep only last 2 messages
+            
+            # Store in database (implement your store_db functions)
+            # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
+            logger.info(f"chat response: {final_answer}")
+            
+            return {"text": final_answer, "type": "text"}
+            
+        except Exception as e:
+            logger.error(f"Error in analyze_query: {str(e)}")
+            final_answer = "Sorry, I couldn't retrieve the report."
+            # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
+            logger.info(f"chat response: {final_answer}")
+            return {"text": final_answer, "type": "text"}
+
+@app.post("/threat_detailed")
+async def analyze_query_detailed(request: QueryRequest):
+    """
+    Alternative implementation that provides more detailed tool call handling
+    similar to your original OpenAI approach
+    """
+    global last_conversation
+    
+    reports = []
+    lower_query = request.query.lower()
+    logger.info(f"data: {request}")
+    
+    if lower_query in simple_conversation_starters:
+        predefined = simple_conversation_starters[lower_query]
+        response = predefined["response"]
+        return {"text": response, "type": "text"}
+    
+    else:
+        # Update conversation history
+        last_conversation = last_conversation[-2:]
+        messages = last_conversation + [{"role": "user", "content": request.query}]
+        last_conversation = last_conversation + [{"role": "user", "content": request.query}]
+        
+        try:
+            # Initialize the Bedrock client
+            llm = initialize_bedrock_client()
+            
+            # Define available tools
+            tools = [
+                get_ip_report_from_virustotal_tool,
+                get_file_report_from_virustotal_tool,
+                get_url_report_from_virustotal_tool,
+                get_subdomains_from_virustotal_tool,
+                get_files_from_virustotal_tool,
+                get_dns_domain_from_virustotal_tool
+            ]
+            
+            # Bind tools to the model
+            llm_with_tools = llm.bind_tools(tools)
+            
+            # Convert to LangChain messages
+            from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+            
+            langchain_messages = []
+            for msg in messages:
+                if msg["role"] == "system":
+                    langchain_messages.append(SystemMessage(content=msg["content"]))
+                elif msg["role"] == "user":
+                    langchain_messages.append(HumanMessage(content=msg["content"]))
+                # Handle assistant messages if needed
+            
+            # Get initial response
+            response_message = llm_with_tools.invoke(langchain_messages)
+            print("response_message:", response_message)
+            
+            # Handle function calls (similar to your original logic)
+            if response_message.tool_calls:
+                for tool_call in response_message.tool_calls:
+                    function_name = tool_call["name"]
+                    function_args = tool_call["args"]
+                    print(f"Function arguments: {function_args}")
+                    
+                    # Call the appropriate VirusTotal function based on the function name
+                    report = None
+                    if function_name == "get_ip_report_from_virustotal_tool":
+                        ip_address = function_args.get("ip_address")
+                        report = get_ip_report_from_virustotal(ip_address)
+                    elif function_name == "get_file_report_from_virustotal_tool":
+                        hash_file = function_args.get("hash_file")
+                        report = get_file_report_from_virustotal(hash_file)
+                    elif function_name == "get_url_report_from_virustotal_tool":
+                        url = function_args.get("url")
+                        report = get_url_report_from_virustotal(url)
+                    elif function_name == "get_subdomains_from_virustotal_tool":
+                        domain = function_args.get("domain")
+                        report = get_subdomains_from_virustotal(domain)
+                    elif function_name == "get_files_from_virustotal_tool":
+                        domain = function_args.get("domain")
+                        report = get_files_from_virustotal(domain)
+                    elif function_name == "get_dns_domain_from_virustotal_tool":
+                        domain = function_args.get("domain")
+                        report = get_dns_domain_from_virustotal(domain)
+                    
+                    if report:
+                        reports.append(report)
+                
+                # Combine all reports into a single context
+                combined_reports = {
+                    "reports": reports
+                }
+                
+                # If reports were generated, format the report data and append to the conversation
+                if combined_reports["reports"]:
+                    # Create tool messages for each tool call
+                    tool_messages = []
+                    for tool_call in response_message.tool_calls:
+                        tool_messages.append(ToolMessage(
+                            content=json.dumps(combined_reports),
+                            tool_call_id=tool_call.get("id", "")
+                        ))
+                    
+                    # Generate a final response to make the output more natural
+                    prompt = f'''I am equipped with the knowledge present in the following context:
+                    {combined_reports}
+                    
+                    Please feel free to ask any questions related to this context, and I will do my best to provide accurate and helpful responses. However, I am programmed to stay within the bounds of the provided context, so I may not be able to answer questions that are outside of its scope.
+                    
+                    Whenever generating an answer the date should be in the format dd/mm/yyyy if present.
+                    The answer format should be as follows:
+                    1)**Summary**: Summary of the {combined_reports} according to the {request.query} in 5 bullet points. Only list if data is present.
+                    2)**Conclusion**: Answer the {request.query} according to the {combined_reports} in natural language.
+                    '''
+                    
+                    final_messages = langchain_messages + [response_message] + tool_messages + [
+                        HumanMessage(content=prompt)
+                    ]
+                    
+                    final_response = llm.invoke(final_messages)
+                    final_answer = final_response.content
+                    
+                    # Store the response
+                    # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
+                    logger.info(f"chat response: {final_answer}")
+                    last_conversation.append({"role": "assistant", "content": final_answer})
+                    last_conversation = last_conversation[-2:]
+                    
+                    return {"text": final_answer, "type": "text"}
+                else:
+                    final_answer = "Sorry, I couldn't retrieve the report."
+                    # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
+                    logger.info(f"chat response: {final_answer}")
+                    return {"text": final_answer, "type": "text"}
+            
+            # If no function call was made, return the initial response
+            last_conversation.append({"role": "assistant", "content": response_message.content})
+            last_conversation = last_conversation[-2:]
+            # store_db.store_query_response_threat(request.user_id, request.query, response_message.content, "text")
+            logger.info(f"Chat response: {response_message.content}")
+            return {"text": response_message.content, "type": "text"}
+            
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "threat-analysis-api"}
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Cybersecurity Threat Analysis API",
+        "version": "2.0.0",
+        "endpoints": [
+            "/threat - Simple threat analysis",
+            "/threat_detailed - Detailed threat analysis",
+            "/health - Health check"
+        ]
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
 import requests
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -210,232 +473,21 @@ def generate_bedrock_response(messages: List[Dict[str, str]]) -> str:
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
-# FastAPI endpoint implementation
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import logging
-
-# Setup logging
-logger = logging.getLogger(__name__)
-
-# FastAPI app
-app = FastAPI()
-
-class QueryRequest(BaseModel):
-    user_id: str
-    query: str
-
-# Global conversation storage (in production, use a proper database)
-last_conversation = []
-
-# Simple conversation starters (same as your original)
-simple_conversation_starters = {
-    "hello": {"response": "Hello! How can I help you with cybersecurity analysis today?"},
-    "hi": {"response": "Hi there! I'm here to help you analyze potential threats using VirusTotal."},
-    "help": {"response": "I can help you analyze IPs, file hashes, URLs, and domains using VirusTotal. Just ask me to check something!"}
-}
-
-@app.post("/threat")
-async def analyze_query(request: QueryRequest):
-    """
-    Analyze cybersecurity threats using AWS Bedrock and VirusTotal
-    """
-    global last_conversation
+# Example usage function (for testing the functions directly)
+def example_usage():
+    """Example of how to use the new Bedrock-based system"""
     
-    print("client:", request)
-    print("type(client):", type(request))
+    # Example messages (similar to your OpenAI format)
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a cybersecurity assistant that can analyze threats using VirusTotal. Use the available tools to help users with their security queries."
+        },
+        {
+            "role": "user", 
+            "content": "Can you check the reputation of IP address 8.8.8.8?"
+        }
+    ]
     
-    reports = []
-    lower_query = request.query.lower()
-    logger.info(f"data: {request}")
-    
-    # Check for simple conversation starters
-    if lower_query in simple_conversation_starters:
-        predefined = simple_conversation_starters[lower_query]
-        response = predefined["response"]
-        return {"text": response, "type": "text"}
-    
-    else:
-        # Update the conversation history
-        last_conversation = last_conversation[-2:]  # Keep only the last conversation
-        # Append the current query to the last conversation
-        messages = last_conversation + [{"role": "user", "content": request.query}]
-        last_conversation = last_conversation + [{"role": "user", "content": request.query}]
-        
-        try:
-            # Generate initial response from AWS Bedrock
-            response = generate_bedrock_response(messages)
-            
-            # The generate_bedrock_response function now handles tool calls internally
-            # and returns the final response as a string
-            final_answer = response
-            
-            # Store the response in conversation history
-            last_conversation.append({"role": "assistant", "content": final_answer})
-            last_conversation = last_conversation[-2:]  # Keep only last 2 messages
-            
-            # Store in database (implement your store_db functions)
-            # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
-            logger.info(f"chat response: {final_answer}")
-            
-            return {"text": final_answer, "type": "text"}
-            
-        except Exception as e:
-            logger.error(f"Error in analyze_query: {str(e)}")
-            final_answer = "Sorry, I couldn't retrieve the report."
-            # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
-            logger.info(f"chat response: {final_answer}")
-            return {"text": final_answer, "type": "text"}
-
-# Alternative implementation that mimics your original OpenAI approach more closely
-@app.post("/threat_detailed")
-async def analyze_query_detailed(request: QueryRequest):
-    """
-    Alternative implementation that provides more detailed tool call handling
-    similar to your original OpenAI approach
-    """
-    global last_conversation
-    
-    reports = []
-    lower_query = request.query.lower()
-    logger.info(f"data: {request}")
-    
-    if lower_query in simple_conversation_starters:
-        predefined = simple_conversation_starters[lower_query]
-        response = predefined["response"]
-        return {"text": response, "type": "text"}
-    
-    else:
-        # Update conversation history
-        last_conversation = last_conversation[-2:]
-        messages = last_conversation + [{"role": "user", "content": request.query}]
-        last_conversation = last_conversation + [{"role": "user", "content": request.query}]
-        
-        try:
-            # Initialize the Bedrock client
-            llm = initialize_bedrock_client()
-            
-            # Define available tools
-            tools = [
-                get_ip_report_from_virustotal_tool,
-                get_file_report_from_virustotal_tool,
-                get_url_report_from_virustotal_tool,
-                get_subdomains_from_virustotal_tool,
-                get_files_from_virustotal_tool,
-                get_dns_domain_from_virustotal_tool
-            ]
-            
-            # Bind tools to the model
-            llm_with_tools = llm.bind_tools(tools)
-            
-            # Convert to LangChain messages
-            from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-            
-            langchain_messages = []
-            for msg in messages:
-                if msg["role"] == "system":
-                    langchain_messages.append(SystemMessage(content=msg["content"]))
-                elif msg["role"] == "user":
-                    langchain_messages.append(HumanMessage(content=msg["content"]))
-                # Handle assistant messages if needed
-            
-            # Get initial response
-            response_message = llm_with_tools.invoke(langchain_messages)
-            print("response_message:", response_message)
-            
-            # Handle function calls (similar to your original logic)
-            if response_message.tool_calls:
-                for tool_call in response_message.tool_calls:
-                    function_name = tool_call["name"]
-                    function_args = tool_call["args"]
-                    print(f"Function arguments: {function_args}")
-                    
-                    # Call the appropriate VirusTotal function based on the function name
-                    report = None
-                    if function_name == "get_ip_report_from_virustotal_tool":
-                        ip_address = function_args.get("ip_address")
-                        report = get_ip_report_from_virustotal(ip_address)
-                    elif function_name == "get_file_report_from_virustotal_tool":
-                        hash_file = function_args.get("hash_file")
-                        report = get_file_report_from_virustotal(hash_file)
-                    elif function_name == "get_url_report_from_virustotal_tool":
-                        url = function_args.get("url")
-                        report = get_url_report_from_virustotal(url)
-                    elif function_name == "get_subdomains_from_virustotal_tool":
-                        domain = function_args.get("domain")
-                        report = get_subdomains_from_virustotal(domain)
-                    elif function_name == "get_files_from_virustotal_tool":
-                        domain = function_args.get("domain")
-                        report = get_files_from_virustotal(domain)
-                    elif function_name == "get_dns_domain_from_virustotal_tool":
-                        domain = function_args.get("domain")
-                        report = get_dns_domain_from_virustotal(domain)
-                    
-                    if report:
-                        reports.append(report)
-                
-                # Combine all reports into a single context
-                combined_reports = {
-                    "reports": reports
-                }
-                
-                # If reports were generated, format the report data and append to the conversation
-                if combined_reports["reports"]:
-                    # Create tool messages for each tool call
-                    tool_messages = []
-                    for tool_call in response_message.tool_calls:
-                        tool_messages.append(ToolMessage(
-                            content=json.dumps(combined_reports),
-                            tool_call_id=tool_call.get("id", "")
-                        ))
-                    
-                    # Generate a final response to make the output more natural
-                    prompt = f'''I am equipped with the knowledge present in the following context:
-                    {combined_reports}
-                    
-                    Please feel free to ask any questions related to this context, and I will do my best to provide accurate and helpful responses. However, I am programmed to stay within the bounds of the provided context, so I may not be able to answer questions that are outside of its scope.
-                    
-                    Whenever generating an answer the date should be in the format dd/mm/yyyy if present.
-                    The answer format should be as follows:
-                    1)**Summary**: Summary of the {combined_reports} according to the {request.query} in 5 bullet points. Only list if data is present.
-                    2)**Conclusion**: Answer the {request.query} according to the {combined_reports} in natural language.
-                    '''
-                    
-                    final_messages = langchain_messages + [response_message] + tool_messages + [
-                        HumanMessage(content=prompt)
-                    ]
-                    
-                    final_response = llm.invoke(final_messages)
-                    final_answer = final_response.content
-                    
-                    # Store the response
-                    # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
-                    logger.info(f"chat response: {final_answer}")
-                    last_conversation.append({"role": "assistant", "content": final_answer})
-                    last_conversation = last_conversation[-2:]
-                    
-                    return {"text": final_answer, "type": "text"}
-                else:
-                    final_answer = "Sorry, I couldn't retrieve the report."
-                    # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
-                    logger.info(f"chat response: {final_answer}")
-                    return {"text": final_answer, "type": "text"}
-            
-            # If no function call was made, return the initial response
-            last_conversation.append({"role": "assistant", "content": response_message.content})
-            last_conversation = last_conversation[-2:]
-            # store_db.store_query_response_threat(request.user_id, request.query, response_message.content, "text")
-            logger.info(f"Chat response: {response_message.content}")
-            return {"text": response_message.content, "type": "text"}
-            
-        except Exception as e:
-            logger.error(f"Error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-# Configuration (you'll need to set these)
-virustotal_api_key = "YOUR_VIRUSTOTAL_API_KEY"
-virustotal_api_url = "https://www.virustotal.com/api/v3"
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    response = generate_bedrock_response(messages)
+    print("Response:", response)
