@@ -525,3 +525,89 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+# api.py - Fixed FastAPI endpoint that properly uses imported functions
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import logging
+import json
+
+# Import ALL functions from aws_functions.py
+from aws_functions import generate_bedrock_response
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# FastAPI app
+app = FastAPI(title="Cybersecurity Threat Analysis API", version="2.0.0")
+
+class QueryRequest(BaseModel):
+    user_id: str
+    query: str
+
+# Global conversation storage (in production, use a proper database)
+last_conversation = []
+
+# Simple conversation starters
+simple_conversation_starters = {
+    "hello": {"response": "Hello! How can I help you with cybersecurity analysis today?"},
+    "hi": {"response": "Hi there! I'm here to help you analyze potential threats using VirusTotal."},
+    "help": {"response": "I can help you analyze IPs, file hashes, URLs, and domains using VirusTotal. Just ask me to check something!"}
+}
+
+@app.post("/threat")
+async def analyze_query(request: QueryRequest):
+    """
+    Analyze cybersecurity threats using AWS Bedrock and VirusTotal
+    This endpoint uses the imported generate_bedrock_response function
+    """
+    global last_conversation
+    
+    print("client:", request)
+    print("type(client):", type(request))
+    
+    lower_query = request.query.lower()
+    logger.info(f"data: {request}")
+    
+    # Check for simple conversation starters
+    if lower_query in simple_conversation_starters:
+        predefined = simple_conversation_starters[lower_query]
+        response = predefined["response"]
+        return {"text": response, "type": "text"}
+    
+    else:
+        # Update the conversation history
+        last_conversation = last_conversation[-2:]  # Keep only the last conversation
+        # Append the current query to the last conversation
+        messages = last_conversation + [{"role": "user", "content": request.query}]
+        last_conversation = last_conversation + [{"role": "user", "content": request.query}]
+        
+        try:
+            # THIS IS WHERE WE USE THE IMPORTED FUNCTION
+            response = generate_bedrock_response(messages)
+            final_answer = response
+            
+            print(f"Generated response using imported function: {final_answer}")
+            
+            # Store the response in conversation history
+            last_conversation.append({"role": "assistant", "content": final_answer})
+            last_conversation = last_conversation[-2:]  # Keep only last 2 messages
+            
+            # Store in database (implement your store_db functions)
+            # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
+            logger.info(f"chat response: {final_answer}")
+            
+            return {"text": final_answer, "type": "text"}
+            
+        except Exception as e:
+            logger.error(f"Error in analyze_query: {str(e)}")
+            final_answer = "Sorry, I couldn't retrieve the report."
+            # store_db.store_query_response_threat(request.user_id, request.query, final_answer, "text")
+            logger.info(f"chat response: {final_answer}")
+            return {"text": final_answer, "type": "text"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
