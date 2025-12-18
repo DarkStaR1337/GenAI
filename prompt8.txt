@@ -27,11 +27,14 @@ document_client = DocumentAnalysisClient(
 class PODocumentInfo(BaseModel):
     filename: str
     po_number: Optional[str]
+    page_number_info: Optional[str]
     extracted_data: Dict[str, Any]
     page_count: int
+    original_page_range: str  # e.g., "1-4" or "5-8"
     processed_at: float
     file_hash: str
     sequence_number: int
+    grouping_method: str
 
 class ProcessingStatus(BaseModel):
     total_files: int
@@ -98,6 +101,104 @@ def split_pdf_pages(pdf_bytes: bytes) -> Optional[List[bytes]]:
     return page_byte_list if page_byte_list else None
 
 
+def extract_page_number_from_text(page_bytes: bytes) -> Optional[Tuple[int, Optional[int]]]:
+    """
+    Extract page number from PDF text content.
+    Looks for patterns like "Page 1 of 5", "1/5", etc.
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        
+    Returns:
+        Tuple of (current_page, total_pages) or None if not found
+    """
+    try:
+        doc = fitz.open(stream=page_bytes, filetype="pdf")
+        
+        if doc.page_count < 1:
+            doc.close()
+            return None
+            
+        text = doc[0].get_text("text")
+        doc.close()
+        
+        # Page number patterns
+        patterns = [
+            (r'Page\s+(\d+)\s+of\s+(\d+)', True),   # "Page 1 of 5" - has total
+            (r'Page\s+(\d+)/(\d+)', True),          # "Page 1/5" - has total
+            (r'(\d+)\s+of\s+(\d+)', True),          # "1 of 5" - has total
+            (r'(\d+)/(\d+)', True),                 # "1/5" - has total
+            (r'Page\s+(\d+)', False),               # "Page 1" - no total
+        ]
+        
+        for pattern, has_total in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                if has_total:
+                    current_page = int(match.group(1))
+                    total_pages = int(match.group(2))
+                    logger.debug(f"Found page number (text): {current_page}/{total_pages}")
+                    return (current_page, total_pages)
+                else:
+                    current_page = int(match.group(1))
+                    logger.debug(f"Found page number (text): Page {current_page}")
+                    return (current_page, None)
+                    
+    except Exception as e:
+        logger.error(f"Text extraction error for page number: {str(e)}")
+    
+    return None
+
+
+def extract_page_number_with_di(page_bytes: bytes) -> Optional[Tuple[int, Optional[int]]]:
+    """
+    Extract page number from PDF using Azure Document Intelligence.
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        
+    Returns:
+        Tuple of (current_page, total_pages) or None if not found
+    """
+    try:
+        poller = document_client.begin_analyze_document(
+            model_id="prebuilt-document",
+            document=page_bytes
+        )
+        result = poller.result()
+        
+        full_text = ""
+        if result.content:
+            full_text = result.content
+        
+        if full_text:
+            patterns = [
+                (r'Page\s+(\d+)\s+of\s+(\d+)', True),
+                (r'Page\s+(\d+)/(\d+)', True),
+                (r'(\d+)\s+of\s+(\d+)', True),
+                (r'(\d+)/(\d+)', True),
+                (r'Page\s+(\d+)', False),
+            ]
+            
+            for pattern, has_total in patterns:
+                match = re.search(pattern, full_text, re.IGNORECASE)
+                if match:
+                    if has_total:
+                        current_page = int(match.group(1))
+                        total_pages = int(match.group(2))
+                        logger.debug(f"Found page number (DI): {current_page}/{total_pages}")
+                        return (current_page, total_pages)
+                    else:
+                        current_page = int(match.group(1))
+                        logger.debug(f"Found page number (DI): Page {current_page}")
+                        return (current_page, None)
+        
+    except Exception as e:
+        logger.error(f"Document Intelligence page number extraction error: {str(e)}")
+    
+    return None
+
+
 def extract_po_number_with_di(page_bytes: bytes) -> Optional[str]:
     """
     Extract PO number from a PDF page using Azure Document Intelligence.
@@ -109,36 +210,29 @@ def extract_po_number_with_di(page_bytes: bytes) -> Optional[str]:
         PO number as string, or None if not found
     """
     try:
-        logger.info("Attempting PO extraction with Document Intelligence...")
-        
-        # Use prebuilt-document model for general document analysis
         poller = document_client.begin_analyze_document(
             model_id="prebuilt-document",
             document=page_bytes
         )
         result = poller.result()
         
-        # Extract all text first for logging
         full_text = ""
         if result.content:
             full_text = result.content
-            logger.debug(f"Extracted text length: {len(full_text)} characters")
         
-        # Method 1: Check key-value pairs
+        # Check key-value pairs
         if result.key_value_pairs:
-            logger.info(f"Found {len(result.key_value_pairs)} key-value pairs")
             for kv in result.key_value_pairs:
                 if kv.key and kv.value:
                     key_text = kv.key.content.lower() if kv.key.content else ""
                     value_text = kv.value.content if kv.value.content else ""
                     
-                    # Check if key contains PO-related terms
-                    po_keywords = ["po", "purchase order", "order number", "po number", "p.o"]
+                    po_keywords = ["po", "purchase order", "order number", "po number", "p.o", "order no"]
                     if any(keyword in key_text for keyword in po_keywords):
-                        logger.info(f"Found PO via key-value pair: {key_text} = {value_text}")
+                        logger.debug(f"Found PO via key-value pair: {value_text}")
                         return value_text.strip()
         
-        # Method 2: Search in full content with regex
+        # Search in full content with regex
         if full_text:
             patterns = [
                 r'ORDER\s+NO\.?\s*[:\s]*([A-Za-z0-9\-\/]+)',
@@ -154,13 +248,11 @@ def extract_po_number_with_di(page_bytes: bytes) -> Optional[str]:
                 match = re.search(pattern, full_text, re.IGNORECASE)
                 if match:
                     po_number = match.group(1).strip()
-                    logger.info(f"Found PO via Document Intelligence content + regex: {po_number}")
+                    logger.debug(f"Found PO via DI content + regex: {po_number}")
                     return po_number
         
-        logger.warning("No PO number found via Document Intelligence")
-        
     except Exception as e:
-        logger.error(f"Document Intelligence extraction error: {str(e)}")
+        logger.error(f"Document Intelligence PO extraction error: {str(e)}")
     
     return None
 
@@ -176,20 +268,15 @@ def extract_po_number_fallback(page_bytes: bytes) -> Optional[str]:
         PO number as string, or None if not found
     """
     try:
-        logger.info("Using fallback text extraction method...")
         doc = fitz.open(stream=page_bytes, filetype="pdf")
         
         if doc.page_count < 1:
-            logger.error("PDF has zero pages! Cannot extract text.")
             doc.close()
             return None
             
         text = doc[0].get_text("text")
         doc.close()
         
-        logger.debug(f"Extracted text (first 200 chars): {text[:200]}")
-        
-        # Common PO number patterns
         patterns = [
             r'ORDER\s+NO\.?\s*[:\s]*([A-Za-z0-9\-\/]+)',
             r'NO\.\s*[:\s]*([A-Za-z0-9\-\/]+)',
@@ -204,7 +291,7 @@ def extract_po_number_fallback(page_bytes: bytes) -> Optional[str]:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 po_number = match.group(1).strip()
-                logger.info(f"Found PO via fallback regex: {po_number}")
+                logger.debug(f"Found PO via fallback regex: {po_number}")
                 return po_number
                 
     except Exception as e:
@@ -213,108 +300,125 @@ def extract_po_number_fallback(page_bytes: bytes) -> Optional[str]:
     return None
 
 
-def extract_po_number(page_bytes: bytes, use_di: bool = True) -> Optional[str]:
+def detect_document_boundaries(page_bytes_list: List[bytes], use_di: bool = True) -> List[int]:
     """
-    Extract PO number from a PDF page. Tries Document Intelligence first, 
-    then falls back to regex extraction.
+    Detect where new documents start in the page list.
+    Returns list of page indices where new documents begin.
     
-    Args:
-        page_bytes: Single-page PDF as bytes
-        use_di: Whether to use Document Intelligence (True) or skip to fallback (False)
-        
-    Returns:
-        PO number as string, or None if not found
-    """
-    po_number = None
-    
-    # Try Document Intelligence first
-    if use_di:
-        po_number = extract_po_number_with_di(page_bytes)
-    
-    # Fallback to regex if DI didn't find anything
-    if not po_number:
-        logger.info("Document Intelligence didn't find PO, trying fallback method...")
-        po_number = extract_po_number_fallback(page_bytes)
-    
-    if not po_number:
-        logger.warning("No PO number found on this page")
-    
-    return po_number
-
-
-def group_pages_by_po(page_bytes_list: List[bytes], use_di: bool = True) -> List[Dict[str, Any]]:
-    """
-    Group pages by PO number. Pages with the same PO number are grouped together.
+    Priority:
+    1. When page number = 1 (from text or DI)
+    2. When PO number changes (from DI or regex)
     
     Args:
         page_bytes_list: List of single-page PDF bytes
-        use_di: Whether to use Document Intelligence for extraction
+        use_di: Whether to use Document Intelligence
         
     Returns:
-        List of dictionaries with 'po_number' and 'pages' keys
+        List of indices where new documents start (always includes 0)
+    """
+    boundaries = [0]  # First page always starts a document
+    last_po_number = None
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Detecting document boundaries in {len(page_bytes_list)} pages")
+    logger.info(f"{'='*60}\n")
+    
+    for i, page_bytes in enumerate(page_bytes_list):
+        logger.info(f"Analyzing page {i + 1}/{len(page_bytes_list)}...")
+        
+        # Priority 1: Check for page number = 1 (text method)
+        page_info = extract_page_number_from_text(page_bytes)
+        if page_info and page_info[0] == 1 and i > 0:  # Don't add boundary at index 0 again
+            logger.info(f"  ✓ Found 'Page 1' at position {i + 1} (text) - NEW DOCUMENT")
+            boundaries.append(i)
+            last_po_number = None  # Reset PO tracking
+            continue
+        
+        # Priority 2: Check for page number = 1 (DI method)
+        if use_di:
+            page_info = extract_page_number_with_di(page_bytes)
+            if page_info and page_info[0] == 1 and i > 0:
+                logger.info(f"  ✓ Found 'Page 1' at position {i + 1} (DI) - NEW DOCUMENT")
+                boundaries.append(i)
+                last_po_number = None
+                continue
+        
+        # Priority 3: Check for PO number change (DI method)
+        if use_di:
+            po_number = extract_po_number_with_di(page_bytes)
+            if po_number:
+                if last_po_number is None:
+                    last_po_number = po_number
+                    logger.info(f"  → PO number: {po_number}")
+                elif po_number != last_po_number and i > 0:
+                    logger.info(f"  ✓ PO changed from '{last_po_number}' to '{po_number}' at position {i + 1} (DI) - NEW DOCUMENT")
+                    boundaries.append(i)
+                    last_po_number = po_number
+                    continue
+                else:
+                    logger.info(f"  → PO number: {po_number} (same)")
+        
+        # Priority 4: Check for PO number change (regex fallback)
+        if not use_di or last_po_number is None:
+            po_number = extract_po_number_fallback(page_bytes)
+            if po_number:
+                if last_po_number is None:
+                    last_po_number = po_number
+                    logger.info(f"  → PO number: {po_number} (regex)")
+                elif po_number != last_po_number and i > 0:
+                    logger.info(f"  ✓ PO changed from '{last_po_number}' to '{po_number}' at position {i + 1} (regex) - NEW DOCUMENT")
+                    boundaries.append(i)
+                    last_po_number = po_number
+                    continue
+                else:
+                    logger.info(f"  → PO number: {po_number} (same, regex)")
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Detected {len(boundaries)} document(s)")
+    for idx, boundary in enumerate(boundaries):
+        end_idx = boundaries[idx + 1] - 1 if idx + 1 < len(boundaries) else len(page_bytes_list) - 1
+        logger.info(f"  Document {idx + 1}: Pages {boundary + 1} to {end_idx + 1}")
+    logger.info(f"{'='*60}\n")
+    
+    return boundaries
+
+
+def group_pages_by_boundaries(page_bytes_list: List[bytes], boundaries: List[int]) -> List[Dict[str, Any]]:
+    """
+    Group pages based on detected boundaries.
+    
+    Args:
+        page_bytes_list: List of single-page PDF bytes
+        boundaries: List of indices where documents start
+        
+    Returns:
+        List of dictionaries with page ranges and pages
     """
     groups = []
-    current_group = []
-    current_po_number = None
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Starting PO grouping for {len(page_bytes_list)} pages")
-    logger.info(f"{'='*60}\n")
-
-    for i, page_bytes in enumerate(page_bytes_list):
-        logger.info(f"\n--- Processing page {i + 1}/{len(page_bytes_list)} ---")
-        po_num = extract_po_number(page_bytes, use_di=use_di)
+    
+    for i in range(len(boundaries)):
+        start_idx = boundaries[i]
+        end_idx = boundaries[i + 1] if i + 1 < len(boundaries) else len(page_bytes_list)
         
-        if po_num:
-            # Found a PO number on this page
-            if current_po_number is None:
-                # Start first group
-                current_group = [page_bytes]
-                current_po_number = po_num
-                logger.info(f"✓ Starting new PO group: {po_num}")
-            elif po_num == current_po_number:
-                # Same PO, add to current group
-                current_group.append(page_bytes)
-                logger.info(f"✓ Added page to PO {po_num} (now {len(current_group)} pages)")
-            else:
-                # Different PO, save current group and start new one
-                logger.info(f"✓ Completing PO {current_po_number} with {len(current_group)} pages")
-                groups.append({
-                    'po_number': current_po_number, 
-                    'pages': current_group
-                })
-                current_group = [page_bytes]
-                current_po_number = po_num
-                logger.info(f"✓ Starting new PO group: {po_num}")
-        else:
-            # No PO number found, add to current group
-            if not current_group:
-                # Start a group without PO number
-                current_group = [page_bytes]
-                current_po_number = None
-                logger.warning(f"⚠ Page {i + 1}: No PO number found, starting unnamed group")
-            else:
-                # Add to existing group
-                current_group.append(page_bytes)
-                logger.info(f"✓ Page {i + 1}: No PO number, added to current group (PO: {current_po_number})")
-    
-    # Add the last group
-    if current_group:
-        logger.info(f"\n✓ Completing final PO {current_po_number} with {len(current_group)} pages")
+        pages = page_bytes_list[start_idx:end_idx]
+        page_range = f"{start_idx + 1}-{end_idx}"
+        
         groups.append({
-            'po_number': current_po_number, 
-            'pages': current_group
+            'start_page': start_idx + 1,
+            'end_page': end_idx,
+            'page_range': page_range,
+            'pages': pages
         })
+        
+        logger.info(f"Group {i + 1}: Original pages {page_range} ({len(pages)} pages)")
     
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Total PO groups created: {len(groups)}")
-    logger.info(f"{'='*60}\n")
     return groups
 
 
 def assemble_pdf_from_pages(page_bytes_group: List[bytes]) -> bytes:
     """
     Combine multiple single-page PDFs into one multi-page PDF.
+    Pages will be renumbered starting from 1.
     
     Args:
         page_bytes_group: List of single-page PDF bytes
@@ -336,7 +440,7 @@ def assemble_pdf_from_pages(page_bytes_group: List[bytes]) -> bytes:
     out_bytes = pdf.write()
     pdf.close()
     
-    logger.info(f"Successfully assembled {len(page_bytes_group)} pages into PDF")
+    logger.info(f"Successfully assembled {len(page_bytes_group)} pages into PDF (renumbered 1-{len(page_bytes_group)})")
     return bytes(out_bytes)
 
 
@@ -436,6 +540,7 @@ def extract_pos_from_pdf(pdf_bytes: bytes, original_filename: str,
                          use_di: bool = True) -> List[PODocumentInfo]:
     """
     Main function to extract and process multiple POs from a single PDF.
+    Uses actual PDF page positions to split documents.
     
     Args:
         pdf_bytes: Raw bytes of the input PDF
@@ -446,11 +551,11 @@ def extract_pos_from_pdf(pdf_bytes: bytes, original_filename: str,
     Returns:
         List of PODocumentInfo objects for each extracted PO
     """
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'='*80}")
     logger.info(f"Starting PO extraction from: {original_filename}")
     logger.info(f"File size: {len(pdf_bytes)} bytes")
     logger.info(f"Using Document Intelligence: {use_di}")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'='*80}\n")
     
     # Step 1: Split PDF into individual pages
     logger.info("STEP 1: Splitting PDF into pages...")
@@ -459,12 +564,16 @@ def extract_pos_from_pdf(pdf_bytes: bytes, original_filename: str,
         logger.error("Failed to split PDF into pages")
         return []
     
-    # Step 2: Group pages by PO number
-    logger.info("\nSTEP 2: Grouping pages by PO number...")
-    groups = group_pages_by_po(page_bytes_list, use_di=use_di)
+    # Step 2: Detect document boundaries
+    logger.info("\nSTEP 2: Detecting document boundaries...")
+    boundaries = detect_document_boundaries(page_bytes_list, use_di=use_di)
     
-    # Step 3: Process each group
-    logger.info("\nSTEP 3: Processing each PO group...")
+    # Step 3: Group pages by boundaries
+    logger.info("\nSTEP 3: Grouping pages by boundaries...")
+    groups = group_pages_by_boundaries(page_bytes_list, boundaries)
+    
+    # Step 4: Process each group
+    logger.info("\nSTEP 4: Processing each document group...")
     po_documents = []
     base_filename = os.path.splitext(original_filename)[0]
     
@@ -473,14 +582,30 @@ def extract_pos_from_pdf(pdf_bytes: bytes, original_filename: str,
             logger.warning(f"Group {idx}: No pages to process, skipping")
             continue
         
-        po_number = group['po_number'] or f"UNKNOWN_{idx}"
-        logger.info(f"\n--- Processing PO {idx}/{len(groups)}: {po_number} ({len(group['pages'])} pages) ---")
+        page_range = group['page_range']
+        logger.info(f"\n{'─'*60}")
+        logger.info(f"Processing Document {idx}/{len(groups)}")
+        logger.info(f"Original page range: {page_range}")
+        logger.info(f"New page count: {len(group['pages'])} (renumbered 1-{len(group['pages'])})")
+        logger.info(f"{'─'*60}")
         
-        # Assemble multi-page PO PDF
+        # Assemble PDF (pages will be automatically renumbered)
         po_pdf_bytes = assemble_pdf_from_pages(group['pages'])
         
+        # Try to extract PO number from first page for filename
+        po_number = None
+        if use_di:
+            po_number = extract_po_number_with_di(group['pages'][0])
+        if not po_number:
+            po_number = extract_po_number_fallback(group['pages'][0])
+        
         # Generate filename
-        po_filename = f"{base_filename}_PO_{po_number}.pdf"
+        if po_number:
+            safe_po = po_number.replace('/', '_').replace(' ', '_')
+            po_filename = f"{base_filename}_PO_{safe_po}_pages{page_range.replace('-', '_')}.pdf"
+        else:
+            po_filename = f"{base_filename}_Document{idx}_pages{page_range.replace('-', '_')}.pdf"
+        
         po_filepath = os.path.join(output_dir, po_filename)
         
         # Save to file
@@ -491,25 +616,39 @@ def extract_pos_from_pdf(pdf_bytes: bytes, original_filename: str,
         # Extract data using Document Intelligence
         extracted_data = extract_po_data_with_di(po_pdf_bytes, po_filename) if use_di else {}
         
+        # Extract page number info from first page
+        page_number_info = None
+        page_info = extract_page_number_from_text(group['pages'][0])
+        if not page_info and use_di:
+            page_info = extract_page_number_with_di(group['pages'][0])
+        if page_info:
+            if page_info[1]:  # Has total pages
+                page_number_info = f"{page_info[0]}/{page_info[1]}"
+            else:
+                page_number_info = f"Page {page_info[0]}"
+        
         # Create document info
         doc_info = PODocumentInfo(
             filename=po_filename,
             po_number=po_number,
+            page_number_info=page_number_info,
             extracted_data=extracted_data,
             page_count=len(group['pages']),
+            original_page_range=page_range,
             processed_at=time.time(),
             file_hash=calculate_file_hash(po_pdf_bytes),
-            sequence_number=idx
+            sequence_number=idx,
+            grouping_method="boundary_detection"
         )
         
         po_documents.append(doc_info)
-        logger.info(f"✓ Successfully processed PO: {po_filename}")
+        logger.info(f"✓ Successfully processed: {po_filename}")
     
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'='*80}")
     logger.info(f"Extraction complete!")
-    logger.info(f"Total POs extracted: {len(po_documents)}")
+    logger.info(f"Total documents extracted: {len(po_documents)}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'='*80}\n")
     
     return po_documents
 
@@ -544,12 +683,12 @@ def main():
         for doc in po_documents:
             print(f"\n{'─'*80}")
             print(f"Filename: {doc.filename}")
-            print(f"Grouping Method: {doc.grouping_method}")
+            print(f"Original Pages: {doc.original_page_range} (from source PDF)")
+            print(f"New Page Count: {doc.page_count} (renumbered as 1-{doc.page_count})")
             if doc.page_number_info:
-                print(f"Page Number: {doc.page_number_info}")
+                print(f"Page Number on Document: {doc.page_number_info}")
             if doc.po_number:
                 print(f"PO Number: {doc.po_number}")
-            print(f"Pages in Document: {doc.page_count}")
             print(f"File Hash: {doc.file_hash[:32]}...")
             print(f"Processed: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(doc.processed_at))}")
             
@@ -557,7 +696,6 @@ def main():
                 kv_count = len(doc.extracted_data["key_value_pairs"])
                 if kv_count > 0:
                     print(f"Key-Value Pairs: {kv_count}")
-                    # Show first few pairs
                     for i, (k, v) in enumerate(list(doc.extracted_data["key_value_pairs"].items())[:3]):
                         print(f"  • {k}: {v}")
             
@@ -569,65 +707,11 @@ def main():
         print("\n" + "="*80)
         print(f"Total documents extracted: {len(po_documents)}")
         print(f"Output directory: {output_directory}")
-        print("\nGrouping Priority Used:")
-        print("  1. Page Number (from text)")
-        print("  2. Page Number (from Document Intelligence)")
-        print("  3. PO Number (from Document Intelligence)")
-        print("  4. PO Number (from regex)")
-        print("="*80)
-        
-    except FileNotFoundError:
-        logger.error(f"Input file not found: {input_pdf_path}")
-        print(f"\n❌ Error: File '{input_pdf_path}' not found!")
-        print("Please update the 'input_pdf_path' variable with your PDF file path.")
-    except Exception as e:
-        logger.error(f"Error during processing: {e}", exc_info=True)
-        print(f"\n❌ Error: {e}")
-
-
-if __name__ == "__main__":
-    main()}", exc_info=True)
-        print(f"\n❌ Error: {e}")
-
-
-if __name__ == "__main__":
-    main() POs
-        po_documents = extract_pos_from_pdf(
-            pdf_bytes=pdf_bytes,
-            original_filename=os.path.basename(input_pdf_path),
-            output_dir=output_directory,
-            use_di=use_document_intelligence
-        )
-        
-        # Print detailed summary
-        print("\n" + "="*80)
-        print("EXTRACTION SUMMARY")
-        print("="*80)
-        
-        for doc in po_documents:
-            print(f"\n{'─'*80}")
-            print(f"PO Number: {doc.po_number}")
-            print(f"Filename: {doc.filename}")
-            print(f"Pages: {doc.page_count}")
-            print(f"File Hash: {doc.file_hash[:32]}...")
-            print(f"Processed: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(doc.processed_at))}")
-            
-            if doc.extracted_data and "key_value_pairs" in doc.extracted_data:
-                kv_count = len(doc.extracted_data["key_value_pairs"])
-                if kv_count > 0:
-                    print(f"Key-Value Pairs: {kv_count}")
-                    # Show first few pairs
-                    for i, (k, v) in enumerate(list(doc.extracted_data["key_value_pairs"].items())[:3]):
-                        print(f"  • {k}: {v}")
-            
-            if doc.extracted_data and "tables" in doc.extracted_data:
-                table_count = len(doc.extracted_data["tables"])
-                if table_count > 0:
-                    print(f"Tables: {table_count}")
-        
-        print("\n" + "="*80)
-        print(f"Total POs extracted: {len(po_documents)}")
-        print(f"Output directory: {output_directory}")
+        print("\nHow it works:")
+        print("  1. Detects where 'Page 1' appears (text or DI)")
+        print("  2. Detects when PO number changes (DI or regex)")
+        print("  3. Splits at these boundaries")
+        print("  4. Renumbers each document's pages starting from 1")
         print("="*80)
         
     except FileNotFoundError:
