@@ -1,0 +1,824 @@
+import os
+import re
+import time
+import hashlib
+import logging
+from typing import List, Dict, Any, Tuple, Optional
+from pydantic import BaseModel
+import fitz  # PyMuPDF
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Azure Document Intelligence Configuration
+AZURE_ENDPOINT = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "YOUR_ENDPOINT_HERE")
+AZURE_KEY = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY", "YOUR_KEY_HERE")
+
+# Initialize Azure Document Intelligence Client
+document_client = DocumentAnalysisClient(
+    endpoint=AZURE_ENDPOINT,
+    credential=AzureKeyCredential(AZURE_KEY)
+)
+
+# Pydantic Models
+class PODocumentInfo(BaseModel):
+    filename: str
+    po_number: Optional[str]
+    page_number_info: Optional[str]
+    extracted_data: Dict[str, Any]
+    page_count: int
+    processed_at: float
+    file_hash: str
+    sequence_number: int
+    grouping_method: str  # 'page_number', 'po_number', or 'unknown'
+
+class ProcessingStatus(BaseModel):
+    total_files: int
+    processed_files: int
+    pending_files: int
+    recently_processed: List[str]
+    error_files: List[str]
+    is_running: bool
+
+
+def calculate_file_hash(file_bytes: bytes) -> str:
+    """Calculate SHA256 hash of file content."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def split_pdf_pages(pdf_bytes: bytes) -> Optional[List[bytes]]:
+    """
+    Split a multi-page PDF into individual single-page PDFs.
+    
+    Args:
+        pdf_bytes: Raw bytes of the PDF file
+        
+    Returns:
+        List of single-page PDF bytes, or None if error
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = doc.page_count
+        logger.info(f"Opening PDF with {total_pages} pages (size={len(pdf_bytes)} bytes)")
+        
+        if total_pages == 0:
+            logger.error("PDF has 0 pages")
+            doc.close()
+            return None
+            
+    except Exception as e:
+        logger.error(f"split_pdf_pages: Couldn't open PDF: {e}")
+        return None
+
+    page_byte_list = []
+    for page_num in range(total_pages):
+        single_pdf = fitz.open()
+        try:
+            # Insert only this specific page
+            single_pdf.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            
+            if single_pdf.page_count != 1:
+                logger.error(f"Failed to extract page {page_num + 1} (got {single_pdf.page_count} pages)")
+                single_pdf.close()
+                continue
+            
+            # Write to bytes
+            buf = single_pdf.write()
+            page_byte_list.append(bytes(buf))
+            logger.info(f"✓ Extracted page {page_num + 1}/{total_pages}")
+            
+        except Exception as e:
+            logger.error(f"split_pdf_pages: Couldn't extract page {page_num + 1}: {e}")
+        finally:
+            single_pdf.close()
+    
+    doc.close()
+    logger.info(f"Successfully split PDF into {len(page_byte_list)} pages")
+    return page_byte_list if page_byte_list else None
+
+
+def extract_page_number_from_text(page_bytes: bytes) -> Optional[str]:
+    """
+    Extract page number from PDF using text extraction and regex.
+    Looks for patterns like "Page 1 of 5", "1/5", "Page 1/5", etc.
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        
+    Returns:
+        Page number info as string (e.g., "1/5"), or None if not found
+    """
+    try:
+        logger.info("Attempting page number extraction from text...")
+        doc = fitz.open(stream=page_bytes, filetype="pdf")
+        
+        if doc.page_count < 1:
+            logger.error("PDF has zero pages! Cannot extract text.")
+            doc.close()
+            return None
+            
+        text = doc[0].get_text("text")
+        doc.close()
+        
+        # Page number patterns (most specific to least specific)
+        patterns = [
+            r'Page\s+(\d+)\s+of\s+(\d+)',  # "Page 1 of 5"
+            r'Page\s+(\d+)/(\d+)',          # "Page 1/5"
+            r'(\d+)\s+of\s+(\d+)',          # "1 of 5"
+            r'(\d+)/(\d+)',                 # "1/5"
+            r'Page\s+(\d+)',                # "Page 1" (without total)
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                if len(match.groups()) == 2:
+                    page_info = f"{match.group(1)}/{match.group(2)}"
+                    logger.info(f"Found page number via text regex: {page_info}")
+                    return page_info
+                elif len(match.groups()) == 1:
+                    page_info = match.group(1)
+                    logger.info(f"Found page number via text regex: Page {page_info}")
+                    return f"Page {page_info}"
+                    
+    except Exception as e:
+        logger.error(f"Text extraction error for page number: {str(e)}")
+    
+    logger.warning("No page number found in text")
+    return None
+
+
+def extract_page_number_with_di(page_bytes: bytes) -> Optional[str]:
+    """
+    Extract page number from PDF using Azure Document Intelligence.
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        
+    Returns:
+        Page number info as string, or None if not found
+    """
+    try:
+        logger.info("Attempting page number extraction with Document Intelligence...")
+        
+        poller = document_client.begin_analyze_document(
+            model_id="prebuilt-document",
+            document=page_bytes
+        )
+        result = poller.result()
+        
+        # Extract full text
+        full_text = ""
+        if result.content:
+            full_text = result.content
+        
+        # Search for page numbers in content
+        if full_text:
+            patterns = [
+                r'Page\s+(\d+)\s+of\s+(\d+)',
+                r'Page\s+(\d+)/(\d+)',
+                r'(\d+)\s+of\s+(\d+)',
+                r'(\d+)/(\d+)',
+                r'Page\s+(\d+)',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, full_text, re.IGNORECASE)
+                if match:
+                    if len(match.groups()) == 2:
+                        page_info = f"{match.group(1)}/{match.group(2)}"
+                        logger.info(f"Found page number via DI content: {page_info}")
+                        return page_info
+                    elif len(match.groups()) == 1:
+                        page_info = match.group(1)
+                        logger.info(f"Found page number via DI content: Page {page_info}")
+                        return f"Page {page_info}"
+        
+        logger.warning("No page number found via Document Intelligence")
+        
+    except Exception as e:
+        logger.error(f"Document Intelligence page number extraction error: {str(e)}")
+    
+    return None
+
+
+def extract_po_number_with_di(page_bytes: bytes) -> Optional[str]:
+    """
+    Extract PO number from a PDF page using Azure Document Intelligence.
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        
+    Returns:
+        PO number as string, or None if not found
+    """
+    try:
+        logger.info("Attempting PO extraction with Document Intelligence...")
+        
+        # Use prebuilt-document model for general document analysis
+        poller = document_client.begin_analyze_document(
+            model_id="prebuilt-document",
+            document=page_bytes
+        )
+        result = poller.result()
+        
+        # Extract all text first for logging
+        full_text = ""
+        if result.content:
+            full_text = result.content
+            logger.debug(f"Extracted text length: {len(full_text)} characters")
+        
+        # Method 1: Check key-value pairs
+        if result.key_value_pairs:
+            logger.info(f"Found {len(result.key_value_pairs)} key-value pairs")
+            for kv in result.key_value_pairs:
+                if kv.key and kv.value:
+                    key_text = kv.key.content.lower() if kv.key.content else ""
+                    value_text = kv.value.content if kv.value.content else ""
+                    
+                    # Check if key contains PO-related terms
+                    po_keywords = ["po", "purchase order", "order number", "po number", "p.o", "order no"]
+                    if any(keyword in key_text for keyword in po_keywords):
+                        logger.info(f"Found PO via key-value pair: {key_text} = {value_text}")
+                        return value_text.strip()
+        
+        # Method 2: Search in full content with regex
+        if full_text:
+            patterns = [
+                r'ORDER\s+NO\.?\s*[:\s]*([A-Za-z0-9\-\/]+)',
+                r'NO\.\s*[:\s]*([A-Za-z0-9\-\/]+)',
+                r'PO\s*#[:\s]*([A-Za-z0-9\-\/]+)',
+                r'P\.?O\.?\s*Number[:\s]*([A-Za-z0-9\-\/]+)',
+                r'Purchase\s*Order\s*#?[:\s]*([A-Za-z0-9\-\/]+)',
+                r'Order\s*Number[:\s]*([A-Za-z0-9\-\/]+)',
+                r'PO[:\s]+([A-Za-z0-9\-\/]{5,})',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, full_text, re.IGNORECASE)
+                if match:
+                    po_number = match.group(1).strip()
+                    logger.info(f"Found PO via Document Intelligence content + regex: {po_number}")
+                    return po_number
+        
+        logger.warning("No PO number found via Document Intelligence")
+        
+    except Exception as e:
+        logger.error(f"Document Intelligence extraction error: {str(e)}")
+    
+    return None
+
+
+def extract_po_number_fallback(page_bytes: bytes) -> Optional[str]:
+    """
+    Fallback method: Extract PO number using PyMuPDF text extraction and regex.
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        
+    Returns:
+        PO number as string, or None if not found
+    """
+    try:
+        logger.info("Using fallback text extraction method for PO...")
+        doc = fitz.open(stream=page_bytes, filetype="pdf")
+        
+        if doc.page_count < 1:
+            logger.error("PDF has zero pages! Cannot extract text.")
+            doc.close()
+            return None
+            
+        text = doc[0].get_text("text")
+        doc.close()
+        
+        logger.debug(f"Extracted text (first 200 chars): {text[:200]}")
+        
+        # Common PO number patterns
+        patterns = [
+            r'ORDER\s+NO\.?\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'NO\.\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'PO\s*#[:\s]*([A-Za-z0-9\-\/]+)',
+            r'P\.?O\.?\s*Number[:\s]*([A-Za-z0-9\-\/]+)',
+            r'Purchase\s*Order\s*#?[:\s]*([A-Za-z0-9\-\/]+)',
+            r'Order\s*Number[:\s]*([A-Za-z0-9\-\/]+)',
+            r'PO[:\s]+([A-Za-z0-9\-\/]{5,})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                po_number = match.group(1).strip()
+                logger.info(f"Found PO via fallback regex: {po_number}")
+                return po_number
+                
+    except Exception as e:
+        logger.error(f"Fallback text extraction error: {str(e)}")
+    
+    return None
+
+
+def extract_document_identifier(page_bytes: bytes, use_di: bool = True) -> Dict[str, Optional[str]]:
+    """
+    Extract document identifiers with priority: Page Number > PO Number.
+    
+    Priority order:
+    1. Page number from text
+    2. Page number from Document Intelligence
+    3. PO number from Document Intelligence
+    4. PO number from regex fallback
+    
+    Args:
+        page_bytes: Single-page PDF as bytes
+        use_di: Whether to use Document Intelligence
+        
+    Returns:
+        Dictionary with 'page_number', 'po_number', and 'grouping_key' fields
+    """
+    result = {
+        'page_number': None,
+        'po_number': None,
+        'grouping_key': None,
+        'grouping_method': 'unknown'
+    }
+    
+    # Priority 1: Try to extract page number from text
+    logger.info("PRIORITY 1: Checking for page number in text...")
+    page_num = extract_page_number_from_text(page_bytes)
+    if page_num:
+        result['page_number'] = page_num
+        result['grouping_key'] = page_num
+        result['grouping_method'] = 'page_number_text'
+        logger.info(f"✓ Using page number for grouping: {page_num}")
+        return result
+    
+    # Priority 2: Try Document Intelligence for page number
+    if use_di:
+        logger.info("PRIORITY 2: Checking for page number via Document Intelligence...")
+        page_num = extract_page_number_with_di(page_bytes)
+        if page_num:
+            result['page_number'] = page_num
+            result['grouping_key'] = page_num
+            result['grouping_method'] = 'page_number_di'
+            logger.info(f"✓ Using page number for grouping: {page_num}")
+            return result
+    
+    # Priority 3: Try Document Intelligence for PO number
+    if use_di:
+        logger.info("PRIORITY 3: Checking for PO number via Document Intelligence...")
+        po_num = extract_po_number_with_di(page_bytes)
+        if po_num:
+            result['po_number'] = po_num
+            result['grouping_key'] = po_num
+            result['grouping_method'] = 'po_number_di'
+            logger.info(f"✓ Using PO number for grouping: {po_num}")
+            return result
+    
+    # Priority 4: Fallback to regex for PO number
+    logger.info("PRIORITY 4: Checking for PO number via regex fallback...")
+    po_num = extract_po_number_fallback(page_bytes)
+    if po_num:
+        result['po_number'] = po_num
+        result['grouping_key'] = po_num
+        result['grouping_method'] = 'po_number_regex'
+        logger.info(f"✓ Using PO number for grouping: {po_num}")
+        return result
+    
+    logger.warning("⚠ No identifier found on this page")
+    return result
+
+
+def parse_page_number(page_info: str) -> Tuple[int, Optional[int]]:
+    """
+    Parse page number string to extract current page and total pages.
+    
+    Args:
+        page_info: String like "1/5", "Page 1", etc.
+        
+    Returns:
+        Tuple of (current_page, total_pages). total_pages is None if not found.
+    """
+    # Try "1/5" format
+    match = re.match(r'(\d+)/(\d+)', page_info)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    
+    # Try "Page 1" format
+    match = re.match(r'Page\s+(\d+)', page_info, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), None
+    
+    # Try just number
+    match = re.match(r'(\d+)', page_info)
+    if match:
+        return int(match.group(1)), None
+    
+    return 0, None
+
+
+def group_pages_by_identifier(page_bytes_list: List[bytes], use_di: bool = True) -> List[Dict[str, Any]]:
+    """
+    Group pages by document identifier (page number preferred, then PO number).
+    
+    Args:
+        page_bytes_list: List of single-page PDF bytes
+        use_di: Whether to use Document Intelligence for extraction
+        
+    Returns:
+        List of dictionaries with identifier and pages
+    """
+    groups = []
+    current_group = []
+    current_identifier = None
+    current_method = None
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Starting document grouping for {len(page_bytes_list)} pages")
+    logger.info(f"{'='*60}\n")
+
+    for i, page_bytes in enumerate(page_bytes_list):
+        logger.info(f"\n{'─'*60}")
+        logger.info(f"Processing page {i + 1}/{len(page_bytes_list)}")
+        logger.info(f"{'─'*60}")
+        
+        extracted = extract_document_identifier(page_bytes, use_di=use_di)
+        identifier = extracted['grouping_key']
+        method = extracted['grouping_method']
+        
+        logger.info(f"Extracted - Page#: {extracted['page_number']}, PO#: {extracted['po_number']}")
+        logger.info(f"Grouping by: {identifier} (method: {method})")
+        
+        if identifier:
+            # Check if this is a page number and if it's sequential
+            if method.startswith('page_number'):
+                current_page, total = parse_page_number(identifier)
+                
+                # If page number is 1, start a new group
+                if current_page == 1:
+                    if current_group:
+                        logger.info(f"✓ Completing group with identifier '{current_identifier}' ({len(current_group)} pages)")
+                        groups.append({
+                            'identifier': current_identifier,
+                            'method': current_method,
+                            'pages': current_group
+                        })
+                    current_group = [page_bytes]
+                    current_identifier = identifier
+                    current_method = method
+                    logger.info(f"✓ Starting new group: {identifier}")
+                else:
+                    # Not page 1, add to current group
+                    if not current_group:
+                        current_group = [page_bytes]
+                        current_identifier = identifier
+                        current_method = method
+                        logger.info(f"✓ Starting new group: {identifier}")
+                    else:
+                        current_group.append(page_bytes)
+                        logger.info(f"✓ Added to current group (now {len(current_group)} pages)")
+            else:
+                # PO number grouping - group by same identifier
+                if current_identifier is None:
+                    current_group = [page_bytes]
+                    current_identifier = identifier
+                    current_method = method
+                    logger.info(f"✓ Starting new group: {identifier}")
+                elif identifier == current_identifier:
+                    current_group.append(page_bytes)
+                    logger.info(f"✓ Added to group {identifier} (now {len(current_group)} pages)")
+                else:
+                    logger.info(f"✓ Completing group '{current_identifier}' ({len(current_group)} pages)")
+                    groups.append({
+                        'identifier': current_identifier,
+                        'method': current_method,
+                        'pages': current_group
+                    })
+                    current_group = [page_bytes]
+                    current_identifier = identifier
+                    current_method = method
+                    logger.info(f"✓ Starting new group: {identifier}")
+        else:
+            # No identifier found
+            if not current_group:
+                current_group = [page_bytes]
+                current_identifier = None
+                current_method = 'unknown'
+                logger.warning(f"⚠ No identifier found, starting unnamed group")
+            else:
+                current_group.append(page_bytes)
+                logger.info(f"✓ No identifier, added to current group")
+    
+    # Add the last group
+    if current_group:
+        logger.info(f"\n✓ Completing final group '{current_identifier}' ({len(current_group)} pages)")
+        groups.append({
+            'identifier': current_identifier,
+            'method': current_method,
+            'pages': current_group
+        })
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Total groups created: {len(groups)}")
+    for idx, group in enumerate(groups, 1):
+        logger.info(f"  Group {idx}: {group['identifier']} ({group['method']}) - {len(group['pages'])} pages")
+    logger.info(f"{'='*60}\n")
+    
+    return groups
+
+
+def assemble_pdf_from_pages(page_bytes_group: List[bytes]) -> bytes:
+    """
+    Combine multiple single-page PDFs into one multi-page PDF.
+    
+    Args:
+        page_bytes_group: List of single-page PDF bytes
+        
+    Returns:
+        Combined PDF as bytes
+    """
+    pdf = fitz.open()
+    
+    for idx, page_bytes in enumerate(page_bytes_group):
+        try:
+            single_doc = fitz.open(stream=page_bytes, filetype='pdf')
+            pdf.insert_pdf(single_doc, from_page=0, to_page=0)
+            single_doc.close()
+            logger.debug(f"Assembled page {idx + 1}/{len(page_bytes_group)}")
+        except Exception as e:
+            logger.error(f"Error assembling page {idx + 1}: {e}")
+    
+    out_bytes = pdf.write()
+    pdf.close()
+    
+    logger.info(f"Successfully assembled {len(page_bytes_group)} pages into PDF")
+    return bytes(out_bytes)
+
+
+def extract_po_data_with_di(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Extract structured data from PO using Azure Document Intelligence.
+    
+    Args:
+        pdf_bytes: PDF file as bytes
+        filename: Original filename
+        
+    Returns:
+        Dictionary containing extracted PO data
+    """
+    extracted_data = {
+        "filename": filename,
+        "extraction_method": "document_intelligence",
+        "fields": {},
+        "key_value_pairs": {},
+        "tables": []
+    }
+    
+    try:
+        logger.info(f"Extracting data from {filename} using Document Intelligence...")
+        
+        poller = document_client.begin_analyze_document(
+            model_id="prebuilt-document",
+            document=pdf_bytes
+        )
+        result = poller.result()
+        
+        # Extract key-value pairs
+        if result.key_value_pairs:
+            for kv in result.key_value_pairs:
+                if kv.key and kv.value:
+                    key_text = kv.key.content if kv.key.content else ""
+                    value_text = kv.value.content if kv.value.content else ""
+                    extracted_data["key_value_pairs"][key_text] = value_text
+            logger.info(f"Extracted {len(extracted_data['key_value_pairs'])} key-value pairs")
+        
+        # Extract tables
+        if result.tables:
+            for table_idx, table in enumerate(result.tables):
+                table_data = {
+                    "row_count": table.row_count,
+                    "column_count": table.column_count,
+                    "cells": []
+                }
+                for cell in table.cells:
+                    table_data["cells"].append({
+                        "row_index": cell.row_index,
+                        "column_index": cell.column_index,
+                        "content": cell.content
+                    })
+                extracted_data["tables"].append(table_data)
+            logger.info(f"Extracted {len(result.tables)} tables")
+        
+        # Extract general content
+        if result.content:
+            extracted_data["full_content"] = result.content
+            logger.info(f"Extracted full content ({len(result.content)} characters)")
+        
+        logger.info(f"✓ Successfully extracted data from {filename}")
+        
+    except Exception as e:
+        logger.error(f"Document Intelligence data extraction failed for {filename}: {e}")
+        extracted_data["extraction_method"] = "failed"
+        extracted_data["error"] = str(e)
+    
+    return extracted_data
+
+
+def save_pdf_to_file(pdf_bytes: bytes, output_path: str) -> bool:
+    """
+    Save PDF bytes to a file.
+    
+    Args:
+        pdf_bytes: PDF content as bytes
+        output_path: Full path where to save the file
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'wb') as f:
+            f.write(pdf_bytes)
+        logger.info(f"✓ Saved PDF to: {output_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving PDF to {output_path}: {e}")
+        return False
+
+
+def extract_pos_from_pdf(pdf_bytes: bytes, original_filename: str, 
+                         output_dir: str = "./output",
+                         use_di: bool = True) -> List[PODocumentInfo]:
+    """
+    Main function to extract and process multiple POs from a single PDF.
+    Groups by page number first, then PO number.
+    
+    Args:
+        pdf_bytes: Raw bytes of the input PDF
+        original_filename: Original filename for reference
+        output_dir: Directory where to save split PO files
+        use_di: Whether to use Document Intelligence
+        
+    Returns:
+        List of PODocumentInfo objects for each extracted PO
+    """
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Starting PO extraction from: {original_filename}")
+    logger.info(f"File size: {len(pdf_bytes)} bytes")
+    logger.info(f"Using Document Intelligence: {use_di}")
+    logger.info(f"Grouping Priority: Page Number > PO Number")
+    logger.info(f"{'='*60}\n")
+    
+    # Step 1: Split PDF into individual pages
+    logger.info("STEP 1: Splitting PDF into pages...")
+    page_bytes_list = split_pdf_pages(pdf_bytes)
+    if not page_bytes_list:
+        logger.error("Failed to split PDF into pages")
+        return []
+    
+    # Step 2: Group pages by identifier (page number preferred, then PO)
+    logger.info("\nSTEP 2: Grouping pages by identifier (Page# > PO#)...")
+    groups = group_pages_by_identifier(page_bytes_list, use_di=use_di)
+    
+    # Step 3: Process each group
+    logger.info("\nSTEP 3: Processing each document group...")
+    po_documents = []
+    base_filename = os.path.splitext(original_filename)[0]
+    
+    for idx, group in enumerate(groups, 1):
+        if not group['pages']:
+            logger.warning(f"Group {idx}: No pages to process, skipping")
+            continue
+        
+        identifier = group['identifier'] or f"UNKNOWN_{idx}"
+        method = group['method']
+        logger.info(f"\n{'─'*60}")
+        logger.info(f"Processing Group {idx}/{len(groups)}")
+        logger.info(f"Identifier: {identifier}")
+        logger.info(f"Method: {method}")
+        logger.info(f"Pages: {len(group['pages'])}")
+        logger.info(f"{'─'*60}")
+        
+        # Assemble multi-page PDF
+        po_pdf_bytes = assemble_pdf_from_pages(group['pages'])
+        
+        # Generate filename based on grouping method
+        safe_identifier = identifier.replace('/', '_').replace(' ', '_')
+        if method.startswith('page_number'):
+            po_filename = f"{base_filename}_Pages_{safe_identifier}.pdf"
+        else:
+            po_filename = f"{base_filename}_PO_{safe_identifier}.pdf"
+        
+        po_filepath = os.path.join(output_dir, po_filename)
+        
+        # Save to file
+        if not save_pdf_to_file(po_pdf_bytes, po_filepath):
+            logger.error(f"Failed to save {po_filename}, skipping...")
+            continue
+        
+        # Extract data using Document Intelligence
+        extracted_data = extract_po_data_with_di(po_pdf_bytes, po_filename) if use_di else {}
+        
+        # Determine page_number and po_number for the document
+        page_number_info = identifier if method.startswith('page_number') else None
+        po_number = identifier if method.startswith('po_number') else None
+        
+        # Create document info
+        doc_info = PODocumentInfo(
+            filename=po_filename,
+            po_number=po_number,
+            page_number_info=page_number_info,
+            extracted_data=extracted_data,
+            page_count=len(group['pages']),
+            processed_at=time.time(),
+            file_hash=calculate_file_hash(po_pdf_bytes),
+            sequence_number=idx,
+            grouping_method=method
+        )
+        
+        po_documents.append(doc_info)
+        logger.info(f"✓ Successfully processed: {po_filename}")
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Extraction complete!")
+    logger.info(f"Total documents extracted: {len(po_documents)}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"{'='*60}\n")
+    
+    return po_documents
+
+
+def main():
+    """Example usage of the PO extraction system."""
+    
+    # Configuration
+    input_pdf_path = "sample_multi_po.pdf"  # Change this to your PDF file
+    output_directory = "./extracted_pos"
+    use_document_intelligence = True  # Set to False to use only regex
+    
+    try:
+        # Read the input PDF
+        logger.info(f"Reading input file: {input_pdf_path}")
+        with open(input_pdf_path, 'rb') as f:
+            pdf_bytes = f.read()
+        
+        # Extract and process POs
+        po_documents = extract_pos_from_pdf(
+            pdf_bytes=pdf_bytes,
+            original_filename=os.path.basename(input_pdf_path),
+            output_dir=output_directory,
+            use_di=use_document_intelligence
+        )
+        
+        # Print detailed summary
+        print("\n" + "="*80)
+        print("EXTRACTION SUMMARY")
+        print("="*80)
+        
+        for doc in po_documents:
+            print(f"\n{'─'*80}")
+            print(f"Filename: {doc.filename}")
+            print(f"Grouping Method: {doc.grouping_method}")
+            if doc.page_number_info:
+                print(f"Page Number: {doc.page_number_info}")
+            if doc.po_number:
+                print(f"PO Number: {doc.po_number}")
+            print(f"Pages in Document: {doc.page_count}")
+            print(f"File Hash: {doc.file_hash[:32]}...")
+            print(f"Processed: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(doc.processed_at))}")
+            
+            if doc.extracted_data and "key_value_pairs" in doc.extracted_data:
+                kv_count = len(doc.extracted_data["key_value_pairs"])
+                if kv_count > 0:
+                    print(f"Key-Value Pairs: {kv_count}")
+                    # Show first few pairs
+                    for i, (k, v) in enumerate(list(doc.extracted_data["key_value_pairs"].items())[:3]):
+                        print(f"  • {k}: {v}")
+            
+            if doc.extracted_data and "tables" in doc.extracted_data:
+                table_count = len(doc.extracted_data["tables"])
+                if table_count > 0:
+                    print(f"Tables: {table_count}")
+        
+        print("\n" + "="*80)
+        print(f"Total documents extracted: {len(po_documents)}")
+        print(f"Output directory: {output_directory}")
+        print("\nGrouping Priority Used:")
+        print("  1. Page Number (from text)")
+        print("  2. Page Number (from Document Intelligence)")
+        print("  3. PO Number (from Document Intelligence)")
+        print("  4. PO Number (from regex)")
+        print("="*80)
+        
+    except FileNotFoundError:
+        logger.error(f"Input file not found: {input_pdf_path}")
+        print(f"\n❌ Error: File '{input_pdf_path}' not found!")
+        print("Please update the 'input_pdf_path' variable with your PDF file path.")
+    except Exception as e:
+        logger.error(f"Error during processing: {e}", exc_info=True)
+        print(f"\n❌ Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
