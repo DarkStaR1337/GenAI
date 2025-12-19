@@ -1,323 +1,613 @@
-import os
-import json
-import pandas as pd
-from azure.storage.blob import BlobServiceClient
-from langchain_aws import ChatBedrock
-from langchain.schema import HumanMessage, SystemMessage
-from langchain_experimental.agents import create_csv_agent
-from langchain.agents import AgentType
-from fastapi import HTTPException
+import re
 import logging
+from typing import List, Dict, Tuple, Optional, Any
+import fitz
+import hashlib
+from azure.ai.formrecognizer import DocumentAnalysisClient
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_demisto_data():
-    """
-    Fetch data from Azure Blob Storage and return processed DataFrame
-    """
-    try:
-        # Azure Blob Storage connection (keeping this part unchanged)
-        connection_string = os.environ.get("BLOB_CONNECTION_STRING")
-        container = os.environ.get("container_name")
-        filename = "data.json"
-        
-        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        container_client = blob_service_client.get_container_client(container)
-        blob_client = container_client.get_blob_client(filename)
-        blob_data = blob_client.download_blob().readall()
-        demisto_data_inc = json.loads(blob_data)
-        
-        # Process the data
-        df_selected = pd.DataFrame.from_dict(demisto_data_inc)
-        df_selected = pd.json_normalize(df_selected['data'])
-        
-        # Select and rename columns
-        to_keep = ['id', 'type', 'name', 'severity', 'status', 'closeReason', 'CustomFields.remarks']
-        df = df_selected[to_keep]
-        df = df.rename(columns={'CustomFields.remarks': 'Remarks', 'closeReason': 'Close_Reason'})
-        df = df.fillna("")
-        
-        # Data transformations
-        df.loc[:, 'severity'] = df['severity'].replace([0, 0.5, 1, 2, 3, 4], 
-                                                      ['Unknown', 'Informational', 'Low', 'Medium', 'High', 'Critical'])
-        df.loc[:, 'status'] = df['status'].replace([0, 1, 2], ['Pending', 'Active', 'Closed'])
-        df = df.sort_values(by='id')
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error fetching Demisto data: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-def get_bedrock_client():
+class POStructureAnalyzer:
     """
-    Initialize and return AWS Bedrock client
+    Analyzes PDF pages for PO structure patterns with intelligent header repetition handling:
+    - Headers (PO, Invoice, Order indicators)
+    - Footer content (Subtotal, Total, Tax)
+    - Line item tables
+    - Content continuation detection
     """
-    try:
-        return ChatBedrock(
-            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",  # Using Claude 3.5 Sonnet
-            region_name="ap-southeast-1",  # APAC region
-            model_kwargs={
-                "max_tokens": 1000,
-                "temperature": 0.1,
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Bedrock client: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to initialize AWS Bedrock: {str(e)}")
-
-def analyze_sentiment(text):
-    """
-    Analyze sentiment using AWS Bedrock Claude
-    """
-    try:
-        if not text or pd.isna(text) or text.strip() == '':
-            return 'Neutral'
-            
-        bedrock_client = get_bedrock_client()
-        
-        # Create messages for sentiment analysis
-        system_message = SystemMessage(
-            content="Analyze the sentiment of the following text. Is it positive, neutral, or negative? "
-                   "Only give one word as the answer: Positive/Neutral/Negative. If the text is empty or null or has no context "
-                   "then the answer should be Neutral."
-        )
-        
-        human_message = HumanMessage(content=f"Analyze the sentiment of the following text: {text}")
-        
-        messages = [system_message, human_message]
-        
-        # Get response from Bedrock
-        response = bedrock_client.invoke(messages)
-        
-        # Extract sentiment from response content
-        sentiment = response.content.strip()
-        
-        return sentiment
-        
-    except Exception as e:
-        logger.error(f"Error in sentiment analysis: {str(e)}")
-        return 'Neutral'  # Return neutral as fallback instead of raising exception
-
-def sentiment_analysis_ai(df):
-    """
-    Apply sentiment analysis to the DataFrame using AWS Bedrock
-    """
-    try:
-        # Apply sentiment analysis to remarks column
-        df['Sentiment'] = df['Remarks'].apply(
-            lambda remark: analyze_sentiment(remark) if pd.notnull(remark) and remark.strip() != '' else 'Neutral'
-        )
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error in sentiment analysis AI: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-def create_bedrock_csv_agent(csv_file_path, prefix=""):
-    """
-    Create a CSV agent using AWS Bedrock Claude
-    """
-    try:
-        # Initialize AWS Bedrock LLM for CSV agent
-        bedrock_llm = ChatBedrock(
-            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-            region_name="ap-southeast-1",
-            model_kwargs={
-                "max_tokens": 4000,
-                "temperature": 0.1,
-            }
-        )
-        
-        # Create CSV agent with AWS Bedrock
-        agent = create_csv_agent(
-            bedrock_llm,
-            csv_file_path,
-            verbose=True,
-            prefix=prefix,
-            agent_type=AgentType.OPENAI_FUNCTIONS,  # This works with Claude as well
-            allow_dangerous_code=True,
-            agent_executor_kwargs={"handle_parsing_errors": True, "return_only_outputs": True}
-        )
-        
-        return agent
-        
-    except Exception as e:
-        logger.error(f"Error creating CSV agent: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create CSV agent: {str(e)}")
-
-def query_bedrock_agent(agent, query):
-    """
-    Query the Bedrock agent and return response
-    """
-    try:
-        result = agent.invoke(query)
-        return result['output']
-        
-    except Exception as e:
-        logger.error(f"Error querying Bedrock agent: {str(e)}")
-        # Return a fallback response instead of raising exception
-        return "I apologize, but I'm having trouble processing your request with the agent. Please try rephrasing your question."
-
-def direct_bedrock_query(query, df):
-    """
-    Fallback function to query Bedrock directly with DataFrame context
-    """
-    try:
-        bedrock_client = get_bedrock_client()
-        
-        # Create context from DataFrame (limit to avoid token limits)
-        df_summary = df.head(10).to_string()
-        
-        prompt = f"""
-        Based on the following incident data with sentiment analysis:
-        
-        {df_summary}
-        
-        Please answer the following question: {query}
-        
-        Instructions:
-        - Always mention the incident ID when referring to specific incidents
-        - Use only the information provided in the data
-        - If you can't find relevant information, say so clearly
+    
+    # Header patterns - indicate START of a new document
+    HEADER_PATTERNS = [
+        r'(?:PURCHASE\s*ORDER|PO\s*:|ORDER\s*FORM|INVOICE\s*|QUOTATION)',
+        r'(?:BILL\s*TO|SHIP\s*TO|VENDOR|SUPPLIER)',
+        r'(?:ORDER\s*DATE|PO\s*DATE|INVOICE\s*DATE)',
+        r'(?:ATTENTION|ATTN|CONTACT)',
+    ]
+    
+    # Footer patterns - indicate END of a document (before new one)
+    FOOTER_PATTERNS = [
+        r'(?:TOTAL|GRAND\s*TOTAL|NET\s*TOTAL)',
+        r'(?:SUBTOTAL|SUB\s*TOTAL)',
+        r'(?:TAX|GST|VAT|SALES\s*TAX)',
+        r'(?:SHIPPING|FREIGHT|DELIVERY)',
+        r'(?:BALANCE\s*DUE|AMOUNT\s*DUE)',
+        r'(?:THANK\s*YOU|TERMS\s*AND\s*CONDITIONS|PAYMENT\s*TERMS)',
+    ]
+    
+    # Line item indicators (tables with quantity, price, amount)
+    LINE_ITEM_PATTERNS = [
+        r'(?:ITEM|DESCRIPTION|PRODUCT)',
+        r'(?:QTY|QUANTITY|QTY\.)',
+        r'(?:UNIT\s*PRICE|PRICE|RATE)',
+        r'(?:AMOUNT|TOTAL|EXTENDED)',
+    ]
+    
+    # Continuation indicators (suggest same document continues)
+    CONTINUATION_PATTERNS = [
+        r'(?:CONTINUED|CONT\'D|CONT\.)',
+        r'(?:PAGE\s*\d+\s*(?:OF|\/)\s*\d+)',  # Page numbering
+        r'(?:—\s*CONTINUED\s*—)',
+        r'(?:\.\.\.|ITEM\s*\d+\s*\(CONT)',
+    ]
+    
+    def __init__(self, di_cache=None):
         """
+        Initialize the analyzer.
         
-        message = HumanMessage(content=prompt)
-        response = bedrock_client.invoke([message])
+        Args:
+            di_cache: PageAnalysisCache instance for reusing DI results
+        """
+        self.di_cache = di_cache
+        self.header_signature_cache = {}  # Cache header signatures
+    
+    def calculate_content_hash(self, text: str) -> str:
+        """Calculate hash of content for comparison."""
+        return hashlib.md5(text.strip().encode()).hexdigest()
+    
+    def extract_page_sections(self, page_bytes: bytes) -> Dict[str, Any]:
+        """
+        Extract distinct sections from a page: header, body, footer.
         
-        return response.content.strip()
+        Args:
+            page_bytes: Single-page PDF as bytes
+            
+        Returns:
+            Dictionary with 'header', 'body', 'footer' text sections
+        """
+        try:
+            doc = fitz.open(stream=page_bytes, filetype="pdf")
+            page = doc[0]
+            
+            # Get page dimensions
+            page_height = page.rect.height
+            page_width = page.rect.width
+            
+            # Define sections (approximately)
+            header_rect = fitz.Rect(0, 0, page_width, page_height * 0.15)  # Top 15%
+            footer_rect = fitz.Rect(0, page_height * 0.85, page_width, page_height)  # Bottom 15%
+            body_rect = fitz.Rect(0, page_height * 0.15, page_width, page_height * 0.85)
+            
+            header_text = page.get_text("text", clip=header_rect)
+            body_text = page.get_text("text", clip=body_rect)
+            footer_text = page.get_text("text", clip=footer_rect)
+            
+            doc.close()
+            
+            return {
+                'header': header_text.strip(),
+                'body': body_text.strip(),
+                'footer': footer_text.strip(),
+                'full_text': f"{header_text}\n{body_text}\n{footer_text}"
+            }
         
-    except Exception as e:
-        logger.error(f"Direct Bedrock query error: {str(e)}")
-        return "I'm sorry, I couldn't process your request at the moment. Please try again."
-
-def process_sentiment_query(query, user_id=None):
-    """
-    Main processing function that handles the entire sentiment analysis workflow
-    """
-    try:
-        # Step 1: Fetch and process data
-        logger.info(f"Processing query: {query}")
-        df_sent = get_demisto_data()
+        except Exception as e:
+            logger.error(f"Error extracting page sections: {e}")
+            return {
+                'header': '',
+                'body': '',
+                'footer': '',
+                'full_text': ''
+            }
+    
+    def detect_header_repetition(self, current_page_bytes: bytes, 
+                                 previous_page_bytes: Optional[bytes] = None) -> Tuple[bool, float]:
+        """
+        Detect if header is repeated from previous page (continuation).
         
-        if df_sent.empty:
-            return {"text": "Demistro data is null", "type": "text", "graph_data": None}
+        Strategy:
+        1. Compare header signatures between consecutive pages
+        2. Check for continuation indicators
+        3. Calculate header similarity score
         
-        # Step 2: Apply sentiment analysis
-        df_final_ai = sentiment_analysis_ai(df_sent)
+        Args:
+            current_page_bytes: Current page bytes
+            previous_page_bytes: Previous page bytes (if available)
+            
+        Returns:
+            Tuple of (is_repeated_header, repetition_confidence)
+        """
+        current_sections = self.extract_page_sections(current_page_bytes)
+        current_header = current_sections['header'].upper()
         
-        # Step 3: Save processed data to CSV for agent
-        csv_file_path = "final2.csv"
-        df_final_ai.to_csv(csv_file_path, index=False)
+        # Quick check for continuation keywords
+        for pattern in self.CONTINUATION_PATTERNS:
+            if re.search(pattern, current_sections['full_text'], re.IGNORECASE):
+                logger.debug(f"Continuation pattern found: {pattern}")
+                return True, 0.9  # High confidence - explicit continuation marker
         
-        # Step 4: Create prefix for CSV agent
-        prefix = '''
-        Do not create your own indexing. Use only the information provided in the file.
-        Always mention the incident id corresponding to the information that is being returned.
-        '''
+        if not previous_page_bytes:
+            return False, 0.0
         
-        # Step 5: Check if query requires graph/chart (you can implement graph_query logic here)
-        is_graph_query, graph_type = check_graph_query(query)
+        previous_sections = self.extract_page_sections(previous_page_bytes)
+        previous_header = previous_sections['header'].upper()
         
-        if is_graph_query:
-            # Handle graph/chart queries (implement your graph logic here)
-            graph_data = generate_graph_data(query, df_final_ai, graph_type)
-            if graph_data:
-                return {
-                    "text": "", 
-                    "graph_data": graph_data, 
-                    "type": "y"
-                }
-            else:
-                return {
-                    "text": "Please elaborate your question", 
-                    "type": "text", 
-                    "graph_data": None
-                }
-        else:
-            # Step 6: Handle regular text queries using Bedrock agent
+        # Calculate header similarity
+        if current_header and previous_header:
+            current_hash = self.calculate_content_hash(current_header)
+            previous_hash = self.calculate_content_hash(previous_header)
+            
+            # If headers have same hash, they're identical (very likely repetition)
+            if current_hash == previous_hash:
+                logger.debug("Identical headers detected - likely repetition")
+                return True, 0.95
+            
+            # Calculate Jaccard similarity on tokens
+            current_tokens = set(re.findall(r'\b\w+\b', current_header))
+            previous_tokens = set(re.findall(r'\b\w+\b', previous_header))
+            
+            if not current_tokens or not previous_tokens:
+                return False, 0.0
+            
+            intersection = len(current_tokens & previous_tokens)
+            union = len(current_tokens | previous_tokens)
+            similarity = intersection / union if union > 0 else 0
+            
+            # If header is very similar to previous page's header, likely repetition
+            if similarity > 0.75:  # 75% token overlap
+                logger.debug(f"Similar headers detected (similarity: {similarity:.2%})")
+                return True, 0.85
+        
+        return False, 0.0
+    
+    def detect_body_continuation(self, current_page_bytes: bytes,
+                                previous_page_bytes: Optional[bytes] = None) -> Tuple[bool, float]:
+        """
+        Detect if body content is continuation from previous page.
+        
+        Strategy:
+        1. Check if last line of previous page connects to first line of current
+        2. Line items numbers sequentially increase
+        3. Table structure continues
+        
+        Args:
+            current_page_bytes: Current page bytes
+            previous_page_bytes: Previous page bytes (if available)
+            
+        Returns:
+            Tuple of (is_continuation, continuation_confidence)
+        """
+        if not previous_page_bytes:
+            return False, 0.0
+        
+        current_sections = self.extract_page_sections(current_page_bytes)
+        previous_sections = self.extract_page_sections(previous_page_bytes)
+        
+        current_body = current_sections['body']
+        previous_body = previous_sections['body']
+        
+        if not current_body or not previous_body:
+            return False, 0.0
+        
+        # Get last lines of previous and first lines of current
+        prev_last_lines = previous_body.split('\n')[-3:]  # Last 3 lines
+        curr_first_lines = current_body.split('\n')[:3]   # First 3 lines
+        
+        # Check for line item number sequence
+        # Example: "10" at end of previous page, "11" at start of current
+        prev_numbers = re.findall(r'\b(\d+)\b', ' '.join(prev_last_lines))
+        curr_numbers = re.findall(r'\b(\d+)\b', ' '.join(curr_first_lines))
+        
+        if prev_numbers and curr_numbers:
             try:
-                agent = create_bedrock_csv_agent(csv_file_path, prefix)
-                response_text = query_bedrock_agent(agent, query)
+                prev_last_num = int(prev_numbers[-1])
+                curr_first_num = int(curr_numbers[0])
                 
-                return {
-                    "text": response_text, 
-                    "graph_data": None, 
-                    "type": "text"
-                }
-                
-            except Exception as agent_error:
-                logger.error(f"Agent processing failed: {str(agent_error)}")
-                # Fallback to direct query
-                fallback_response = direct_bedrock_query(query, df_final_ai)
-                return {
-                    "text": fallback_response, 
-                    "graph_data": None, 
-                    "type": "text"
-                }
+                # If numbers are sequential or same (wrapped line)
+                if curr_first_num - prev_last_num in [0, 1]:
+                    logger.debug(f"Sequential line item numbers detected: {prev_last_num} -> {curr_first_num}")
+                    return True, 0.85
+            except ValueError:
+                pass
         
-    except Exception as e:
-        logger.error(f"Error in process_sentiment_query: {str(e)}")
+        # Use DI to check table continuation
+        if self.di_cache:
+            curr_di = self.di_cache.get(current_page_bytes)
+            prev_di = self.di_cache.get(previous_page_bytes)
+            
+            if curr_di and prev_di:
+                # If both have same table structure, likely continuation
+                if (hasattr(curr_di, 'tables') and hasattr(prev_di, 'tables') and
+                    curr_di.tables and prev_di.tables):
+                    
+                    curr_table = curr_di.tables[0]
+                    prev_table = prev_di.tables[0]
+                    
+                    # Check if table dimensions match (same table continuing)
+                    if (curr_table.column_count == prev_table.column_count and
+                        curr_table.row_count > 2):  # More than just headers
+                        logger.debug("Table structure continuation detected")
+                        return True, 0.80
+        
+        return False, 0.0
+    
+    def detect_document_header(self, page_bytes: bytes) -> Tuple[bool, str]:
+        """
+        Detect if page starts a new document (PO header detected).
+        
+        Args:
+            page_bytes: Single-page PDF as bytes
+            
+        Returns:
+            Tuple of (is_header_detected, matched_pattern)
+        """
+        sections = self.extract_page_sections(page_bytes)
+        header_text = sections['header'].upper()
+        
+        # Check header area for PO indicators
+        for pattern in self.HEADER_PATTERNS:
+            if re.search(pattern, header_text, re.IGNORECASE):
+                logger.debug(f"Header pattern matched: {pattern}")
+                return True, pattern
+        
+        return False, ""
+    
+    def detect_document_footer(self, page_bytes: bytes) -> Tuple[bool, str, List[str]]:
+        """
+        Detect if page ends a document (footer indicators detected).
+        Also extracts financial line items from DI results.
+        
+        Args:
+            page_bytes: Single-page PDF as bytes
+            
+        Returns:
+            Tuple of (has_footer, matched_pattern, financial_items)
+        """
+        sections = self.extract_page_sections(page_bytes)
+        footer_text = sections['footer'].upper()
+        full_text = sections['full_text'].upper()
+        
+        financial_items = []
+        
+        # Check for footer indicators
+        footer_matched = ""
+        for pattern in self.FOOTER_PATTERNS:
+            if re.search(pattern, footer_text, re.IGNORECASE):
+                footer_matched = pattern
+                logger.debug(f"Footer pattern matched: {pattern}")
+                break
+        
+        # Extract financial line items from DI results
+        if self.di_cache:
+            di_result = self.di_cache.get(page_bytes)
+            if di_result and hasattr(di_result, 'key_value_pairs'):
+                for kv in di_result.key_value_pairs:
+                    if kv.key and kv.value:
+                        key_text = kv.key.content.upper() if kv.key.content else ""
+                        value_text = kv.value.content if kv.value.content else ""
+                        
+                        # Financial keywords
+                        financial_keywords = [
+                            'TOTAL', 'SUBTOTAL', 'TAX', 'AMOUNT',
+                            'BALANCE', 'DUE', 'GST', 'VAT'
+                        ]
+                        
+                        if any(keyword in key_text for keyword in financial_keywords):
+                            financial_items.append({
+                                'key': key_text,
+                                'value': value_text
+                            })
+        
+        # Also extract from full text using regex
+        financial_patterns = [
+            (r'TOTAL\s*[:\s]+\s*([\$\d\.,]+)', 'TOTAL'),
+            (r'SUBTOTAL\s*[:\s]+\s*([\$\d\.,]+)', 'SUBTOTAL'),
+            (r'TAX\s*[:\s]+\s*([\$\d\.,]+)', 'TAX'),
+            (r'SHIPPING\s*[:\s]+\s*([\$\d\.,]+)', 'SHIPPING'),
+        ]
+        
+        for pattern, label in financial_patterns:
+            match = re.search(pattern, full_text, re.IGNORECASE)
+            if match:
+                financial_items.append({
+                    'key': label,
+                    'value': match.group(1)
+                })
+        
+        has_footer = bool(footer_matched) or bool(financial_items)
+        
+        return has_footer, footer_matched, financial_items
+    
+    def detect_line_items(self, page_bytes: bytes) -> Tuple[bool, int]:
+        """
+        Detect if page contains line items table (invoice/PO details).
+        
+        Args:
+            page_bytes: Single-page PDF as bytes
+            
+        Returns:
+            Tuple of (has_line_items, item_count)
+        """
+        if not self.di_cache:
+            return False, 0
+        
+        try:
+            di_result = self.di_cache.get(page_bytes)
+            
+            if di_result and hasattr(di_result, 'tables'):
+                tables = di_result.tables
+                
+                for table in tables:
+                    # Check if this looks like a line items table
+                    table_text = ""
+                    for cell in table.cells:
+                        if cell.row_index == 0:
+                            table_text += cell.content.upper() + " "
+                    
+                    # Count how many line item headers are present
+                    matched_headers = 0
+                    for pattern in self.LINE_ITEM_PATTERNS:
+                        if re.search(pattern, table_text):
+                            matched_headers += 1
+                    
+                    if matched_headers >= 2:
+                        item_count = max(0, table.row_count - 1)
+                        logger.debug(f"Line items table detected: {item_count} items")
+                        return True, item_count
+        
+        except Exception as e:
+            logger.error(f"Error detecting line items: {e}")
+        
+        return False, 0
+    
+    def get_page_structure_score(self, page_bytes: bytes,
+                                previous_page_bytes: Optional[bytes] = None) -> Dict[str, Any]:
+        """
+        Comprehensive analysis of page structure WITH continuation awareness.
+        
+        Args:
+            page_bytes: Current page bytes
+            previous_page_bytes: Previous page bytes (for context)
+            
+        Returns:
+            Dictionary with structure analysis scores
+        """
+        has_header, header_pattern = self.detect_document_header(page_bytes)
+        has_footer, footer_pattern, financial_items = self.detect_document_footer(page_bytes)
+        has_items, item_count = self.detect_line_items(page_bytes)
+        
+        # NEW: Check for header repetition
+        is_repeated_header, header_rep_confidence = self.detect_header_repetition(
+            page_bytes, 
+            previous_page_bytes
+        )
+        
+        # NEW: Check for body continuation
+        is_body_continuation, body_cont_confidence = self.detect_body_continuation(
+            page_bytes,
+            previous_page_bytes
+        )
+        
+        # Document start confidence
+        # Reduced if header is repeated and no strong indicators of new document
+        start_confidence = 0.0
+        if has_header:
+            start_confidence = 0.8
+            if is_repeated_header:
+                # Repeated header - reduce confidence significantly
+                start_confidence *= (1 - header_rep_confidence)
+                logger.debug(f"Header repeated - reduced start confidence to {start_confidence:.2%}")
+        
+        # Document end confidence
+        end_confidence = 0.0
+        if has_footer and financial_items:
+            end_confidence = 0.9
+        elif has_footer:
+            end_confidence = 0.6
+        
+        # PO document indicator
+        is_po_document = has_items
+        
+        # NEW: If body is continuation, mark this as continuation (not a new document)
+        is_continuation = is_body_continuation or (is_repeated_header and body_cont_confidence > 0.5)
+        
         return {
-            "text": "I apologize, but I encountered an error while processing your request. Please try again.", 
-            "type": "text", 
-            "graph_data": None
+            'has_header': has_header,
+            'header_pattern': header_pattern,
+            'is_repeated_header': is_repeated_header,
+            'header_rep_confidence': header_rep_confidence,
+            'start_confidence': start_confidence,
+            'has_line_items': has_items,
+            'item_count': item_count,
+            'is_body_continuation': is_body_continuation,
+            'body_cont_confidence': body_cont_confidence,
+            'has_footer': has_footer,
+            'footer_pattern': footer_pattern,
+            'financial_items': financial_items,
+            'end_confidence': end_confidence,
+            'is_likely_po': is_po_document and (has_header or item_count > 0),
+            'is_continuation': is_continuation,  # NEW: Page is continuation of same document
         }
 
-def check_graph_query(query):
-    """
-    Determine if query requires graph/chart visualization
-    Implement your existing graph_query logic here
-    """
-    # TODO: Implement your existing graph detection logic
-    # For now, returning False as placeholder
-    graph_keywords = ['chart', 'graph', 'plot', 'visualize', 'show', 'distribution', 'trend']
-    
-    query_lower = query.lower()
-    is_graph = any(keyword in query_lower for keyword in graph_keywords)
-    
-    # Determine graph type based on query
-    graph_type = None
-    if is_graph:
-        if any(word in query_lower for word in ['pie', 'distribution']):
-            graph_type = 'pie'
-        elif any(word in query_lower for word in ['bar', 'count']):
-            graph_type = 'bar'
-        elif any(word in query_lower for word in ['line', 'trend', 'time']):
-            graph_type = 'line'
-        else:
-            graph_type = 'bar'  # default
-    
-    return is_graph, graph_type
 
-def generate_graph_data(query, df, graph_type):
+def detect_boundaries_by_structure(page_bytes_list: List[bytes], 
+                                   di_cache=None) -> List[int]:
     """
-    Generate graph data for visualization
-    Implement your existing graph_json logic here
+    Detect document boundaries using page structure analysis.
+    NOW WITH: Intelligent header repetition handling!
+    
+    Strategy:
+    1. Find pages that START documents (new header that's NOT repeated)
+    2. Find pages that END documents (footer + financial items)
+    3. Ignore repeated headers when body continues
+    4. Assume each document ends before the next one starts
+    
+    Args:
+        page_bytes_list: List of single-page PDF bytes
+        di_cache: PageAnalysisCache instance
+        
+    Returns:
+        List of page indices where new documents start
     """
-    # TODO: Implement your existing graph generation logic
-    # This is a placeholder implementation
+    analyzer = POStructureAnalyzer(di_cache=di_cache)
+    boundaries = [0]
+    
+    page_structures = []
+    
+    logger.info(f"\n{'='*70}")
+    logger.info(f"STRUCTURE-BASED BOUNDARY DETECTION (with repetition handling)")
+    logger.info(f"Analyzing {len(page_bytes_list)} pages...")
+    logger.info(f"{'='*70}\n")
+    
+    # Analyze all pages
+    for i, page_bytes in enumerate(page_bytes_list):
+        previous_bytes = page_bytes_list[i - 1] if i > 0 else None
+        
+        logger.info(f"Page {i + 1}/{len(page_bytes_list)}: Analyzing structure...")
+        
+        structure = analyzer.get_page_structure_score(page_bytes, previous_bytes)
+        page_structures.append(structure)
+        
+        # Log structure details
+        log_str = f"  "
+        if structure['has_header']:
+            log_str += f"[HEADER"
+            if structure['is_repeated_header']:
+                log_str += f":REPEAT({structure['header_rep_confidence']:.0%})"
+            log_str += "] "
+        if structure['has_line_items']:
+            log_str += f"[ITEMS:{structure['item_count']}] "
+        if structure['is_body_continuation']:
+            log_str += f"[CONT({structure['body_cont_confidence']:.0%})] "
+        if structure['has_footer']:
+            log_str += f"[FOOTER] "
+        if structure['financial_items']:
+            log_str += f"[FINANCIALS:{len(structure['financial_items'])}] "
+        
+        logger.info(log_str)
+    
+    # Second pass: Detect boundaries based on structure patterns
+    logger.info(f"\n{'─'*70}")
+    logger.info("DETECTING BOUNDARIES:")
+    logger.info(f"{'─'*70}\n")
+    
+    for i in range(1, len(page_structures)):
+        current_page = page_structures[i]
+        previous_page = page_structures[i - 1]
+        
+        # IMPORTANT: Check if this is just a continuation (repeated header + body continues)
+        if current_page['is_continuation']:
+            logger.info(f"Page {i + 1}: CONTINUATION - Same document continues")
+            continue
+        
+        # Condition 1: Page has NEW header (not repeated) - likely new document start
+        if current_page['has_header'] and not current_page['is_repeated_header']:
+            if current_page['start_confidence'] > 0.5:
+                logger.info(
+                    f"Page {i + 1}: ✓ NEW DOCUMENT - Fresh header detected\n"
+                    f"  Pattern: {current_page['header_pattern']}"
+                )
+                boundaries.append(i)
+                continue
+        
+        # Condition 2: Previous page has strong footer (document end)
+        if (previous_page['has_footer'] and 
+            previous_page['end_confidence'] > 0.6 and 
+            previous_page['financial_items']):
+            logger.info(
+                f"Page {i + 1}: ✓ NEW DOCUMENT - Previous page ended\n"
+                f"  Previous footer confidence: {previous_page['end_confidence']:.0%}\n"
+                f"  Financial items: {[f['key'] for f in previous_page['financial_items']]}"
+            )
+            boundaries.append(i)
+            continue
+        
+        # Condition 3: Header after footer (clear document boundary)
+        if (current_page['has_header'] and not current_page['is_repeated_header'] and
+            previous_page['has_footer'] and 
+            current_page['is_likely_po']):
+            logger.info(
+                f"Page {i + 1}: ✓ NEW DOCUMENT - Header after footer pattern"
+            )
+            boundaries.append(i)
+            continue
+    
+    # Remove duplicates and sort
+    boundaries = sorted(set(boundaries))
+    
+    logger.info(f"\n{'='*70}")
+    logger.info(f"DETECTED {len(boundaries)} DOCUMENT(S):")
+    for idx, boundary in enumerate(boundaries):
+        end_idx = boundaries[idx + 1] - 1 if idx + 1 < len(boundaries) else len(page_bytes_list) - 1
+        logger.info(f"  Document {idx + 1}: Pages {boundary + 1} to {end_idx + 1}")
+    logger.info(f"{'='*70}\n")
+    
+    return boundaries
+
+
+def detect_boundaries_hybrid_enhanced(page_bytes_list: List[bytes],
+                                      use_di: bool = True,
+                                      di_cache=None,
+                                      existing_boundary_func=None) -> List[int]:
+    """
+    Enhanced hybrid boundary detection combining:
+    1. Primary: Traditional method (page numbers + PO numbers)
+    2. Secondary: Structure-based detection (headers + footers + continuation)
+    
+    Args:
+        page_bytes_list: List of single-page PDF bytes
+        use_di: Whether to use Document Intelligence
+        di_cache: PageAnalysisCache instance
+        existing_boundary_func: Function to call for traditional boundary detection
+        
+    Returns:
+        List of page indices where new documents start
+    """
+    
+    logger.info(f"\n{'#'*70}")
+    logger.info(f"HYBRID BOUNDARY DETECTION (Enhanced with repetition handling)")
+    logger.info(f"{'#'*70}\n")
+    
+    boundaries_set = {0}
+    
+    # Method 1: Traditional detection
+    if existing_boundary_func:
+        logger.info("Method 1: Traditional boundary detection (page numbers + PO numbers)...")
+        try:
+            traditional_boundaries = existing_boundary_func(page_bytes_list, use_di=use_di)
+            boundaries_set.update(traditional_boundaries)
+            if len(traditional_boundaries) > 1:
+                logger.info(f"  ✓ Found {len(traditional_boundaries) - 1} boundaries")
+        except Exception as e:
+            logger.warning(f"  Traditional detection failed: {e}")
+    
+    # Method 2: Structure-based detection (NOW WITH REPETITION HANDLING)
+    logger.info("\nMethod 2: Structure-based boundary detection (headers + footers + continuation)...")
     try:
-        if graph_type == 'pie':
-            # Example: Sentiment distribution
-            sentiment_counts = df['Sentiment'].value_counts().to_dict()
-            return {
-                "chart_type": "pie",
-                "data": [{"name": k, "value": v} for k, v in sentiment_counts.items()]
-            }
-        elif graph_type == 'bar':
-            # Example: Status distribution
-            status_counts = df['status'].value_counts().to_dict()
-            return {
-                "chart_type": "bar",
-                "data": [{"name": k, "value": v} for k, v in status_counts.items()]
-            }
-        else:
-            return None
-            
+        structure_boundaries = detect_boundaries_by_structure(
+            page_bytes_list, 
+            di_cache=di_cache
+        )
+        boundaries_set.update(structure_boundaries)
+        if len(structure_boundaries) > 1:
+            logger.info(f"  ✓ Found {len(structure_boundaries) - 1} additional boundaries")
     except Exception as e:
-        logger.error(f"Error generating graph data: {str(e)}")
-        return None
+        logger.warning(f"  Structure detection failed: {e}")
+    
+    final_boundaries = sorted(list(boundaries_set))
+    
+    logger.info(f"\n{'#'*70}")
+    logger.info(f"FINAL RESULT: {len(final_boundaries)} document(s) detected")
+    logger.info(f"{'#'*70}\n")
+    
+    return final_boundaries
