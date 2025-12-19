@@ -1,415 +1,456 @@
 import re
 import logging
-import json
-from typing import Dict, Any, List, Tuple, Optional
-from openai import AzureOpenAI
+from typing import List, Dict, Tuple, Optional, Any
+import fitz
 import hashlib
-
-logger = logging.getLogger(__name__)
-
-# Azure OpenAI Configuration
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "YOUR_ENDPOINT_HERE")
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "YOUR_KEY_HERE")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")  # or "gpt-35-turbo"
-
-# Initialize Azure OpenAI Client
-openai_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_KEY,
-    api_version="2024-02-15-preview",
-    azure_endpoint=AZURE_OPENAI_ENDPOINT
-)
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from openai import AzureOpenAI
+import os
 
 
-class TranslationCache:
-    """Cache for translation results to avoid redundant API calls."""
-    
-    def __init__(self):
-        self.cache = {}
-    
-    @staticmethod
-    def generate_cache_key(text: str, target_lang: str = "en") -> str:
-        """Generate cache key from text content."""
-        content = f"{text}_{target_lang}"
-        return hashlib.md5(content.encode()).hexdigest()
-    
-    def get(self, text: str, target_lang: str = "en") -> Optional[str]:
-        """Get cached translation."""
-        key = self.generate_cache_key(text, target_lang)
-        return self.cache.get(key)
-    
-    def set(self, text: str, translated: str, target_lang: str = "en"):
-        """Cache translation result."""
-        key = self.generate_cache_key(text, target_lang)
-        self.cache[key] = translated
-    
-    def clear(self):
-        """Clear cache."""
-        self.cache.clear()
-
-
-# Global cache instance
-translation_cache = TranslationCache()
-
-
-class MultilingualOrderExtractor:
+class POStructureAnalyzer:
     """
-    Extracts order identifiers (PO, Invoice numbers) from multilingual documents.
-    Supports: English, Spanish, French, German, Portuguese, Italian, etc.
+    Analyzes PDF pages for PO structure patterns with intelligent header repetition handling:
+    - Headers (PO, Invoice, Order indicators)
+    - Footer content (Subtotal, Total, Tax)
+    - Line item tables
+    - Content continuation detection
     """
     
-    # Order number patterns in different languages
-    ORDER_NUMBER_PATTERNS = {
-        'en': [
-            r'(?:ORDER|PO|PURCHASE ORDER|INVOICE|QUOTATION)\s*(?:NUMBER|NUM|NO\.?|ID)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:PO|PO\#|PONO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:ORDER\s*ID)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-        ],
-        'es': [
-            r'(?:PEDIDO|NUMERO DE PEDIDO|NUM PEDIDO|N[ÚU]MERO DE ORDEN|ORDEN)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:FACTURA|NUMERO DE FACTURA|NUM\s*FACTURA)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:COTIZACI[ÓO]N|PRESUPUESTO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-        ],
-        'fr': [
-            r'(?:COMMANDE|NUM[ÉE]RO DE COMMANDE|N°)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:FACTURE|NUM[ÉE]RO DE FACTURE)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:DEVIS|DEVIS NUM[ÉE]RO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-        ],
-        'de': [
-            r'(?:BESTELLUNG|BESTELLNUMMER|BESTELLNR\.?)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:RECHNUNGSNUMMER|RECHNUNGS NR\.?)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:ANGEBOT|ANGEBOTSNUMMER)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-        ],
-        'pt': [
-            r'(?:PEDIDO|NUMERO DO PEDIDO|NÚM\s*PEDIDO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:FATURA|NUMERO DA FATURA|NÚM\s*FATURA)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:COTAÇÃO|ORÇAMENTO|NÚMERO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-        ],
-        'it': [
-            r'(?:ORDINE|NUMERO ORDINE|N°ORDINE)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:FATTURA|NUMERO FATTURA|N°FATTURA)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-            r'(?:PREVENTIVO|NUMERO PREVENTIVO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
-        ],
-    }
+    # Header patterns - indicate START of a new document
+    HEADER_PATTERNS = [
+        r'(?:PURCHASE\s*ORDER|PO\s*:|ORDER\s*FORM|INVOICE\s*|QUOTATION)',
+        r'(?:BILL\s*TO|SHIP\s*TO|VENDOR|SUPPLIER)',
+        r'(?:ORDER\s*DATE|PO\s*DATE|INVOICE\s*DATE)',
+        r'(?:ATTENTION|ATTN|CONTACT)',
+    ]
     
-    # Keywords to identify order-related fields
-    ORDER_KEYWORDS = {
-        'en': ['order', 'po', 'purchase', 'invoice', 'quotation', 'quote', 'number', 'num', 'no', 'id'],
-        'es': ['pedido', 'factura', 'cotización', 'presupuesto', 'número', 'num', 'nro', 'orden'],
-        'fr': ['commande', 'facture', 'devis', 'numéro', 'num', 'n°'],
-        'de': ['bestellung', 'rechnung', 'angebot', 'nummer', 'nr', 'nro'],
-        'pt': ['pedido', 'fatura', 'cotação', 'número', 'num', 'nro', 'orçamento'],
-        'it': ['ordine', 'fattura', 'preventivo', 'numero', 'num', 'n°'],
-    }
+    # Footer patterns - indicate END of a document (before new one)
+    FOOTER_PATTERNS = [
+        r'(?:TOTAL|GRAND\s*TOTAL|NET\s*TOTAL)',
+        r'(?:SUBTOTAL|SUB\s*TOTAL)',
+        r'(?:TAX|GST|VAT|SALES\s*TAX)',
+        r'(?:SHIPPING|FREIGHT|DELIVERY)',
+        r'(?:BALANCE\s*DUE|AMOUNT\s*DUE)',
+        r'(?:THANK\s*YOU|TERMS\s*AND\s*CONDITIONS|PAYMENT\s*TERMS)',
+    ]
     
-    def __init__(self):
-        """Initialize the multilingual order extractor."""
-        self.supported_languages = list(self.ORDER_NUMBER_PATTERNS.keys())
+    # Line item indicators (tables with quantity, price, amount)
+    LINE_ITEM_PATTERNS = [
+        r'(?:ITEM|DESCRIPTION|PRODUCT)',
+        r'(?:QTY|QUANTITY|QTY\.)',
+        r'(?:UNIT\s*PRICE|PRICE|RATE)',
+        r'(?:AMOUNT|TOTAL|EXTENDED)',
+    ]
     
-    def detect_language(self, text: str) -> str:
+    # Continuation indicators (suggest same document continues)
+    CONTINUATION_PATTERNS = [
+        r'(?:CONTINUED|CONT\'D|CONT\.)',
+        r'(?:PAGE\s*\d+\s*(?:OF|\/)\s*\d+)',  # Page numbering
+        r'(?:—\s*CONTINUED\s*—)',
+        r'(?:\.\.\.|ITEM\s*\d+\s*\(CONT)',
+    ]
+    
+    def __init__(self, di_cache=None):
         """
-        Detect the language of the text.
+        Initialize the analyzer.
         
         Args:
-            text: Text to detect language from
+            di_cache: PageAnalysisCache instance for reusing DI results
+        """
+        self.di_cache = di_cache
+        self.header_signature_cache = {}  # Cache header signatures
+    
+    def calculate_content_hash(self, text: str) -> str:
+        """Calculate hash of content for comparison."""
+        return hashlib.md5(text.strip().encode()).hexdigest()
+    
+    def extract_page_sections(self, page_bytes: bytes) -> Dict[str, Any]:
+        """
+        Extract distinct sections from a page: header, body, footer.
+        
+        Args:
+            page_bytes: Single-page PDF as bytes
             
         Returns:
-            Language code (e.g., 'es', 'en', 'fr')
+            Dictionary with 'header', 'body', 'footer' text sections
         """
         try:
-            # Use Azure OpenAI to detect language
-            response = openai_client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a language detection expert. Respond with ONLY the 2-letter ISO 639-1 language code (e.g., 'es', 'en', 'fr'). No explanation needed."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Detect the language of this text:\n\n{text[:500]}"
-                    }
-                ],
-                max_tokens=10,
-                temperature=0
-            )
+            doc = fitz.open(stream=page_bytes, filetype="pdf")
+            page = doc[0]
             
-            lang_code = response.choices[0].message.content.strip().lower()
-            logger.info(f"Detected language: {lang_code}")
-            return lang_code
+            # Get page dimensions
+            page_height = page.rect.height
+            page_width = page.rect.width
+            
+            # Define sections (approximately)
+            header_rect = fitz.Rect(0, 0, page_width, page_height * 0.15)  # Top 15%
+            footer_rect = fitz.Rect(0, page_height * 0.85, page_width, page_height)  # Bottom 15%
+            body_rect = fitz.Rect(0, page_height * 0.15, page_width, page_height * 0.85)
+            
+            header_text = page.get_text("text", clip=header_rect)
+            body_text = page.get_text("text", clip=body_rect)
+            footer_text = page.get_text("text", clip=footer_rect)
+            
+            doc.close()
+            
+            return {
+                'header': header_text.strip(),
+                'body': body_text.strip(),
+                'footer': footer_text.strip(),
+                'full_text': f"{header_text}\n{body_text}\n{footer_text}"
+            }
         
         except Exception as e:
-            logger.error(f"Language detection failed: {e}")
-            return 'en'  # Default to English
+            logger.error(f"Error extracting page sections: {e}")
+            return {
+                'header': '',
+                'body': '',
+                'footer': '',
+                'full_text': ''
+            }
     
-    def translate_text(self, text: str, source_lang: Optional[str] = None, 
-                      target_lang: str = 'en') -> str:
+    def detect_header_repetition(self, current_page_bytes: bytes, 
+                                 previous_page_bytes: Optional[bytes] = None) -> Tuple[bool, float]:
         """
-        Translate text using Azure OpenAI.
+        Detect if header is repeated from previous page (continuation).
+        
+        Strategy:
+        1. Compare header signatures between consecutive pages
+        2. Check for continuation indicators
+        3. Calculate header similarity score
         
         Args:
-            text: Text to translate
-            source_lang: Source language code (auto-detected if None)
-            target_lang: Target language code (default: 'en')
+            current_page_bytes: Current page bytes
+            previous_page_bytes: Previous page bytes (if available)
             
         Returns:
-            Translated text
+            Tuple of (is_repeated_header, repetition_confidence)
         """
-        # If already in target language, return as-is
-        if source_lang and source_lang == target_lang:
-            logger.debug(f"Text already in {target_lang}, skipping translation")
-            return text
+        current_sections = self.extract_page_sections(current_page_bytes)
+        current_header = current_sections['header'].upper()
         
-        # Check cache
-        cached = translation_cache.get(text, target_lang)
-        if cached:
-            logger.debug(f"Using cached translation for {target_lang}")
-            return cached
+        # Quick check for continuation keywords
+        for pattern in self.CONTINUATION_PATTERNS:
+            if re.search(pattern, current_sections['full_text'], re.IGNORECASE):
+                logger.debug(f"Continuation pattern found: {pattern}")
+                return True, 0.9  # High confidence - explicit continuation marker
         
-        try:
-            logger.info(f"Translating text to {target_lang}...")
-            
-            response = openai_client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"You are a professional translator. Translate the following text to {target_lang}. Maintain formatting, line breaks, and special characters. Translate only the content, not labels or structure."
-                    },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ],
-                max_tokens=4000,
-                temperature=0  # Deterministic translation
-            )
-            
-            translated = response.choices[0].message.content.strip()
-            
-            # Cache the translation
-            translation_cache.set(text, translated, target_lang)
-            
-            logger.info(f"✓ Translation successful ({len(translated)} characters)")
-            return translated
+        if not previous_page_bytes:
+            return False, 0.0
         
-        except Exception as e:
-            logger.error(f"Translation failed: {e}")
-            return text  # Return original if translation fails
+        previous_sections = self.extract_page_sections(previous_page_bytes)
+        previous_header = previous_sections['header'].upper()
+        
+        # Calculate header similarity
+        if current_header and previous_header:
+            current_hash = self.calculate_content_hash(current_header)
+            previous_hash = self.calculate_content_hash(previous_header)
+            
+            # If headers have same hash, they're identical (very likely repetition)
+            if current_hash == previous_hash:
+                logger.debug("Identical headers detected - likely repetition")
+                return True, 0.95
+            
+            # Calculate Jaccard similarity on tokens
+            current_tokens = set(re.findall(r'\b\w+\b', current_header))
+            previous_tokens = set(re.findall(r'\b\w+\b', previous_header))
+            
+            if not current_tokens or not previous_tokens:
+                return False, 0.0
+            
+            intersection = len(current_tokens & previous_tokens)
+            union = len(current_tokens | previous_tokens)
+            similarity = intersection / union if union > 0 else 0
+            
+            # If header is very similar to previous page's header, likely repetition
+            if similarity > 0.75:  # 75% token overlap
+                logger.debug(f"Similar headers detected (similarity: {similarity:.2%})")
+                return True, 0.85
+        
+        return False, 0.0
     
-    def extract_order_number_native(self, text: str, language: str) -> Optional[str]:
+    def detect_body_continuation(self, current_page_bytes: bytes,
+                                previous_page_bytes: Optional[bytes] = None) -> Tuple[bool, float]:
         """
-        Extract order number using native language patterns.
+        Detect if body content is continuation from previous page.
+        
+        Strategy:
+        1. Check if last line of previous page connects to first line of current
+        2. Line items numbers sequentially increase
+        3. Table structure continues
         
         Args:
-            text: Text to search (already in native language)
-            language: Language code
+            current_page_bytes: Current page bytes
+            previous_page_bytes: Previous page bytes (if available)
             
         Returns:
-            Order number if found, None otherwise
+            Tuple of (is_continuation, continuation_confidence)
         """
-        if language not in self.ORDER_NUMBER_PATTERNS:
-            logger.warning(f"Language {language} not supported, falling back to English patterns")
-            language = 'en'
+        if not previous_page_bytes:
+            return False, 0.0
         
-        patterns = self.ORDER_NUMBER_PATTERNS[language]
-        text_upper = text.upper()
+        current_sections = self.extract_page_sections(current_page_bytes)
+        previous_sections = self.extract_page_sections(previous_page_bytes)
         
-        for pattern in patterns:
-            match = re.search(pattern, text_upper, re.IGNORECASE)
-            if match:
-                order_num = match.group(1).strip()
-                logger.info(f"Found order number ({language}): {order_num}")
-                return order_num
+        current_body = current_sections['body']
+        previous_body = previous_sections['body']
         
-        return None
+        if not current_body or not previous_body:
+            return False, 0.0
+        
+        # Get last lines of previous and first lines of current
+        prev_last_lines = previous_body.split('\n')[-3:]  # Last 3 lines
+        curr_first_lines = current_body.split('\n')[:3]   # First 3 lines
+        
+        # Check for line item number sequence
+        # Example: "10" at end of previous page, "11" at start of current
+        prev_numbers = re.findall(r'\b(\d+)\b', ' '.join(prev_last_lines))
+        curr_numbers = re.findall(r'\b(\d+)\b', ' '.join(curr_first_lines))
+        
+        if prev_numbers and curr_numbers:
+            try:
+                prev_last_num = int(prev_numbers[-1])
+                curr_first_num = int(curr_numbers[0])
+                
+                # If numbers are sequential or same (wrapped line)
+                if curr_first_num - prev_last_num in [0, 1]:
+                    logger.debug(f"Sequential line item numbers detected: {prev_last_num} -> {curr_first_num}")
+                    return True, 0.85
+            except ValueError:
+                pass
+        
+        # Use DI to check table continuation
+        if self.di_cache:
+            curr_di = self.di_cache.get(current_page_bytes)
+            prev_di = self.di_cache.get(previous_page_bytes)
+            
+            if curr_di and prev_di:
+                # If both have same table structure, likely continuation
+                if (hasattr(curr_di, 'tables') and hasattr(prev_di, 'tables') and
+                    curr_di.tables and prev_di.tables):
+                    
+                    curr_table = curr_di.tables[0]
+                    prev_table = prev_di.tables[0]
+                    
+                    # Check if table dimensions match (same table continuing)
+                    if (curr_table.column_count == prev_table.column_count and
+                        curr_table.row_count > 2):  # More than just headers
+                        logger.debug("Table structure continuation detected")
+                        return True, 0.80
+        
+        return False, 0.0
     
-    def extract_from_di_result(self, di_result: Any, source_lang: Optional[str] = None) -> Dict[str, Any]:
+    def detect_document_header(self, page_bytes: bytes) -> Tuple[bool, str]:
         """
-        Extract and translate order identifiers from DI result.
+        Detect if page starts a new document (PO header detected).
         
         Args:
-            di_result: Document Intelligence result object
-            source_lang: Source language (auto-detect if None)
+            page_bytes: Single-page PDF as bytes
             
         Returns:
-            Dictionary with extracted order info and translations
+            Tuple of (is_header_detected, matched_pattern)
         """
-        result = {
-            'source_language': source_lang,
-            'detected_language': None,
-            'original_text': '',
-            'translated_text': '',
-            'order_numbers': {
-                'original': None,
-                'original_language': None,
-                'translated': None,
-                'source': 'di_result'  # Can be 'di_result', 'kv_pairs', 'regex'
-            },
-            'all_kv_pairs': {},
-            'translated_kv_pairs': {},
-            'confidence_score': 0.0
-        }
+        sections = self.extract_page_sections(page_bytes)
+        header_text = sections['header'].upper()
         
-        if not di_result:
-            logger.warning("Empty DI result provided")
-            return result
+        # Check header area for PO indicators
+        for pattern in self.HEADER_PATTERNS:
+            if re.search(pattern, header_text, re.IGNORECASE):
+                logger.debug(f"Header pattern matched: {pattern}")
+                return True, pattern
         
-        try:
-            # Extract full content from DI
-            full_text = ""
-            if hasattr(di_result, 'content') and di_result.content:
-                full_text = di_result.content
+        return False, ""
+    
+    def detect_document_footer(self, page_bytes: bytes) -> Tuple[bool, str, List[str]]:
+        """
+        Detect if page ends a document (footer indicators detected).
+        Also extracts financial line items from DI results.
+        
+        Args:
+            page_bytes: Single-page PDF as bytes
             
-            result['original_text'] = full_text
-            
-            # Detect language if not provided
-            detected_lang = source_lang
-            if not detected_lang and full_text:
-                detected_lang = self.detect_language(full_text[:500])
-                result['detected_language'] = detected_lang
-            
-            # Try to extract order number from original text (native language)
-            if full_text:
-                order_num = self.extract_order_number_native(full_text, detected_lang or 'en')
-                if order_num:
-                    result['order_numbers']['original'] = order_num
-                    result['order_numbers']['original_language'] = detected_lang
-                    result['order_numbers']['source'] = 'native_regex'
-                    result['confidence_score'] = 0.9
-                    logger.info(f"✓ Found order number in original language: {order_num}")
-            
-            # Extract key-value pairs from DI
-            if hasattr(di_result, 'key_value_pairs') and di_result.key_value_pairs:
+        Returns:
+            Tuple of (has_footer, matched_pattern, financial_items)
+        """
+        sections = self.extract_page_sections(page_bytes)
+        footer_text = sections['footer'].upper()
+        full_text = sections['full_text'].upper()
+        
+        financial_items = []
+        
+        # Check for footer indicators
+        footer_matched = ""
+        for pattern in self.FOOTER_PATTERNS:
+            if re.search(pattern, footer_text, re.IGNORECASE):
+                footer_matched = pattern
+                logger.debug(f"Footer pattern matched: {pattern}")
+                break
+        
+        # Extract financial line items from DI results
+        if self.di_cache:
+            di_result = self.di_cache.get(page_bytes)
+            if di_result and hasattr(di_result, 'key_value_pairs'):
                 for kv in di_result.key_value_pairs:
                     if kv.key and kv.value:
-                        key_text = kv.key.content if kv.key.content else ""
+                        key_text = kv.key.content.upper() if kv.key.content else ""
                         value_text = kv.value.content if kv.value.content else ""
                         
-                        if key_text and value_text:
-                            result['all_kv_pairs'][key_text] = value_text
-            
-            # Translate content and KV pairs to English
-            if detected_lang and detected_lang != 'en' and full_text:
-                logger.info(f"Document in {detected_lang}, translating to English...")
-                
-                translated_text = self.translate_text(full_text, detected_lang, 'en')
-                result['translated_text'] = translated_text
-                
-                # Extract order number from translated text
-                if not result['order_numbers']['original']:
-                    order_num_translated = self.extract_order_number_native(
-                        translated_text, 
-                        'en'
-                    )
-                    if order_num_translated:
-                        result['order_numbers']['translated'] = order_num_translated
-                        result['order_numbers']['source'] = 'translated_regex'
-                        result['confidence_score'] = 0.85
-                        logger.info(f"✓ Found order number in translation: {order_num_translated}")
-                
-                # Translate KV pairs
-                if result['all_kv_pairs']:
-                    kv_text = "\n".join([f"{k}: {v}" for k, v in result['all_kv_pairs'].items()])
-                    translated_kv = self.translate_text(kv_text, detected_lang, 'en')
-                    
-                    # Parse translated KV pairs
-                    for line in translated_kv.split('\n'):
-                        if ':' in line:
-                            k, v = line.split(':', 1)
-                            result['translated_kv_pairs'][k.strip()] = v.strip()
-            else:
-                result['translated_text'] = full_text
-                result['translated_kv_pairs'] = result['all_kv_pairs']
-            
-            return result
+                        # Financial keywords
+                        financial_keywords = [
+                            'TOTAL', 'SUBTOTAL', 'TAX', 'AMOUNT',
+                            'BALANCE', 'DUE', 'GST', 'VAT'
+                        ]
+                        
+                        if any(keyword in key_text for keyword in financial_keywords):
+                            financial_items.append({
+                                'key': key_text,
+                                'value': value_text
+                            })
         
-        except Exception as e:
-            logger.error(f"Error in extract_from_di_result: {e}")
-            return result
+        # Also extract from full text using regex
+        financial_patterns = [
+            (r'TOTAL\s*[:\s]+\s*([\$\d\.,]+)', 'TOTAL'),
+            (r'SUBTOTAL\s*[:\s]+\s*([\$\d\.,]+)', 'SUBTOTAL'),
+            (r'TAX\s*[:\s]+\s*([\$\d\.,]+)', 'TAX'),
+            (r'SHIPPING\s*[:\s]+\s*([\$\d\.,]+)', 'SHIPPING'),
+        ]
+        
+        for pattern, label in financial_patterns:
+            match = re.search(pattern, full_text, re.IGNORECASE)
+            if match:
+                financial_items.append({
+                    'key': label,
+                    'value': match.group(1)
+                })
+        
+        has_footer = bool(footer_matched) or bool(financial_items)
+        
+        return has_footer, footer_matched, financial_items
     
-    def identify_order_field_in_kv(self, kv_pairs: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    def detect_line_items(self, page_bytes: bytes) -> Tuple[bool, int]:
         """
-        Identify order number field from translated KV pairs.
-        Matches common order number field names.
+        Detect if page contains line items table (invoice/PO details).
         
         Args:
-            kv_pairs: Key-value pairs (should be in English)
+            page_bytes: Single-page PDF as bytes
             
         Returns:
-            Tuple of (key, value) if found, (None, None) otherwise
+            Tuple of (has_line_items, item_count)
         """
-        order_keywords = self.ORDER_KEYWORDS['en']
+        if not self.di_cache:
+            return False, 0
         
-        for key, value in kv_pairs.items():
-            key_lower = key.lower()
+        try:
+            di_result = self.di_cache.get(page_bytes)
             
-            # Check how many keywords match this key
-            keyword_matches = sum(1 for kw in order_keywords if kw in key_lower)
+            if di_result and hasattr(di_result, 'tables'):
+                tables = di_result.tables
+                
+                for table in tables:
+                    # Check if this looks like a line items table
+                    table_text = ""
+                    for cell in table.cells:
+                        if cell.row_index == 0:
+                            table_text += cell.content.upper() + " "
+                    
+                    # Count how many line item headers are present
+                    matched_headers = 0
+                    for pattern in self.LINE_ITEM_PATTERNS:
+                        if re.search(pattern, table_text):
+                            matched_headers += 1
+                    
+                    if matched_headers >= 2:
+                        item_count = max(0, table.row_count - 1)
+                        logger.debug(f"Line items table detected: {item_count} items")
+                        return True, item_count
+        
+        except Exception as e:
+            logger.error(f"Error detecting line items: {e}")
+        
+        return False, 0
+    
+    def get_page_structure_score(self, page_bytes: bytes,
+                                previous_page_bytes: Optional[bytes] = None) -> Dict[str, Any]:
+        """
+        Comprehensive analysis of page structure WITH continuation awareness.
+        
+        Args:
+            page_bytes: Current page bytes
+            previous_page_bytes: Previous page bytes (for context)
             
-            if keyword_matches >= 1:
-                logger.info(f"✓ Identified order field: '{key}' = '{value}'")
-                return key, value
+        Returns:
+            Dictionary with structure analysis scores
+        """
+        has_header, header_pattern = self.detect_document_header(page_bytes)
+        has_footer, footer_pattern, financial_items = self.detect_document_footer(page_bytes)
+        has_items, item_count = self.detect_line_items(page_bytes)
         
-        return None, None
-
-
-def extract_po_number_with_translation(page_bytes: bytes, 
-                                       di_result: Any,
-                                       source_language: Optional[str] = None) -> Tuple[Optional[str], str]:
-    """
-    Extract PO number with translation support.
-    
-    Args:
-        page_bytes: Page bytes (for fallback regex)
-        di_result: Document Intelligence result
-        source_language: Source language hint (auto-detect if None)
+        # NEW: Check for header repetition
+        is_repeated_header, header_rep_confidence = self.detect_header_repetition(
+            page_bytes, 
+            previous_page_bytes
+        )
         
-    Returns:
-        Tuple of (order_number, extraction_method)
-        Methods: 'translated_kv', 'native_regex', 'translated_regex', 'fallback', None
-    """
-    extractor = MultilingualOrderExtractor()
-    
-    # Extract and translate
-    extraction_data = extractor.extract_from_di_result(di_result, source_language)
-    
-    # Check for order number in various places
-    if extraction_data['order_numbers']['original']:
-        return (
-            extraction_data['order_numbers']['original'],
-            f"{extraction_data['order_numbers']['source']} ({extraction_data['detected_language']})"
+        # NEW: Check for body continuation
+        is_body_continuation, body_cont_confidence = self.detect_body_continuation(
+            page_bytes,
+            previous_page_bytes
         )
-    
-    if extraction_data['order_numbers']['translated']:
-        return (
-            extraction_data['order_numbers']['translated'],
-            f"{extraction_data['order_numbers']['source']} (from translation)"
-        )
-    
-    # Check translated KV pairs for order fields
-    if extraction_data['translated_kv_pairs']:
-        key, value = extractor.identify_order_field_in_kv(extraction_data['translated_kv_pairs'])
-        if key and value:
-            return value.strip(), f"translated_kv_pair ({key})"
-    
-    # Fallback to regex on original text
-    order_num = extractor.extract_order_number_native(
-        extraction_data['original_text'],
-        extraction_data['detected_language'] or 'en'
-    )
-    if order_num:
-        return order_num, f"native_regex ({extraction_data['detected_language']})"
-    
-    logger.warning("Could not extract order number even with translation")
-    return None, "not_found"
+        
+        # Document start confidence
+        # Reduced if header is repeated and no strong indicators of new document
+        start_confidence = 0.0
+        if has_header:
+            start_confidence = 0.8
+            if is_repeated_header:
+                # Repeated header - reduce confidence significantly
+                start_confidence *= (1 - header_rep_confidence)
+                logger.debug(f"Header repeated - reduced start confidence to {start_confidence:.2%}")
+        
+        # Document end confidence
+        end_confidence = 0.0
+        if has_footer and financial_items:
+            end_confidence = 0.9
+        elif has_footer:
+            end_confidence = 0.6
+        
+        # PO document indicator
+        is_po_document = has_items
+        
+        # NEW: If body is continuation, mark this as continuation (not a new document)
+        is_continuation = is_body_continuation or (is_repeated_header and body_cont_confidence > 0.5)
+        
+        return {
+            'has_header': has_header,
+            'header_pattern': header_pattern,
+            'is_repeated_header': is_repeated_header,
+            'header_rep_confidence': header_rep_confidence,
+            'start_confidence': start_confidence,
+            'has_line_items': has_items,
+            'item_count': item_count,
+            'is_body_continuation': is_body_continuation,
+            'body_cont_confidence': body_cont_confidence,
+            'has_footer': has_footer,
+            'footer_pattern': footer_pattern,
+            'financial_items': financial_items,
+            'end_confidence': end_confidence,
+            'is_likely_po': is_po_document and (has_header or item_count > 0),
+            'is_continuation': is_continuation,  # NEW: Page is continuation of same document
+        }
 
 
-def detect_boundaries_with_translation(page_bytes_list: List[bytes],
-                                       di_cache=None) -> List[int]:
+def detect_boundaries_by_structure(page_bytes_list: List[bytes], 
+                                   di_cache=None) -> List[int]:
     """
-    Detect document boundaries using translation-enhanced order number extraction.
+    Detect document boundaries using page structure analysis.
+    NOW WITH: Intelligent header repetition handling!
     
-    Combines structural detection with multilingual order number identification.
+    Strategy:
+    1. Find pages that START documents (new header that's NOT repeated)
+    2. Find pages that END documents (footer + financial items)
+    3. Ignore repeated headers when body continues
+    4. Assume each document ends before the next one starts
     
     Args:
         page_bytes_list: List of single-page PDF bytes
@@ -418,119 +459,155 @@ def detect_boundaries_with_translation(page_bytes_list: List[bytes],
     Returns:
         List of page indices where new documents start
     """
+    analyzer = POStructureAnalyzer(di_cache=di_cache)
     boundaries = [0]
-    last_order_number = None
-    last_language = None
     
-    logger.info(f"\n{'='*80}")
-    logger.info(f"BOUNDARY DETECTION WITH TRANSLATION SUPPORT")
+    page_structures = []
+    
+    logger.info(f"\n{'='*70}")
+    logger.info(f"STRUCTURE-BASED BOUNDARY DETECTION (with repetition handling)")
     logger.info(f"Analyzing {len(page_bytes_list)} pages...")
-    logger.info(f"{'='*80}\n")
+    logger.info(f"{'='*70}\n")
     
+    # Analyze all pages
     for i, page_bytes in enumerate(page_bytes_list):
-        logger.info(f"Page {i + 1}/{len(page_bytes_list)}: Analyzing with translation...")
+        previous_bytes = page_bytes_list[i - 1] if i > 0 else None
         
-        # Get DI result
-        di_result = None
-        if di_cache:
-            di_result = di_cache.get(page_bytes)
+        logger.info(f"Page {i + 1}/{len(page_bytes_list)}: Analyzing structure...")
         
-        if not di_result:
-            logger.warning(f"  No DI result available for page {i + 1}")
+        structure = analyzer.get_page_structure_score(page_bytes, previous_bytes)
+        page_structures.append(structure)
+        
+        # Log structure details
+        log_str = f"  "
+        if structure['has_header']:
+            log_str += f"[HEADER"
+            if structure['is_repeated_header']:
+                log_str += f":REPEAT({structure['header_rep_confidence']:.0%})"
+            log_str += "] "
+        if structure['has_line_items']:
+            log_str += f"[ITEMS:{structure['item_count']}] "
+        if structure['is_body_continuation']:
+            log_str += f"[CONT({structure['body_cont_confidence']:.0%})] "
+        if structure['has_footer']:
+            log_str += f"[FOOTER] "
+        if structure['financial_items']:
+            log_str += f"[FINANCIALS:{len(structure['financial_items'])}] "
+        
+        logger.info(log_str)
+    
+    # Second pass: Detect boundaries based on structure patterns
+    logger.info(f"\n{'─'*70}")
+    logger.info("DETECTING BOUNDARIES:")
+    logger.info(f"{'─'*70}\n")
+    
+    for i in range(1, len(page_structures)):
+        current_page = page_structures[i]
+        previous_page = page_structures[i - 1]
+        
+        # IMPORTANT: Check if this is just a continuation (repeated header + body continues)
+        if current_page['is_continuation']:
+            logger.info(f"Page {i + 1}: CONTINUATION - Same document continues")
             continue
         
-        # Extract order number with translation
-        order_num, extraction_method = extract_po_number_with_translation(
-            page_bytes,
-            di_result
-        )
-        
-        if order_num:
-            logger.info(f"  ✓ Order number found: {order_num}")
-            logger.info(f"    Extraction method: {extraction_method}")
-            
-            # Check if order number changed
-            if last_order_number is None:
-                last_order_number = order_num
-                logger.info(f"    First order number: {order_num}")
-            elif order_num != last_order_number and i > 0:
+        # Condition 1: Page has NEW header (not repeated) - likely new document start
+        if current_page['has_header'] and not current_page['is_repeated_header']:
+            if current_page['start_confidence'] > 0.5:
                 logger.info(
-                    f"  ✓ NEW DOCUMENT - Order number changed\n"
-                    f"    Previous: {last_order_number}\n"
-                    f"    Current: {order_num}"
+                    f"Page {i + 1}: ✓ NEW DOCUMENT - Fresh header detected\n"
+                    f"  Pattern: {current_page['header_pattern']}"
                 )
                 boundaries.append(i)
-                last_order_number = order_num
-            else:
-                logger.info(f"    Same order number, continuing document")
-        else:
-            logger.info(f"  ⚠ Order number not found")
+                continue
+        
+        # Condition 2: Previous page has strong footer (document end)
+        if (previous_page['has_footer'] and 
+            previous_page['end_confidence'] > 0.6 and 
+            previous_page['financial_items']):
+            logger.info(
+                f"Page {i + 1}: ✓ NEW DOCUMENT - Previous page ended\n"
+                f"  Previous footer confidence: {previous_page['end_confidence']:.0%}\n"
+                f"  Financial items: {[f['key'] for f in previous_page['financial_items']]}"
+            )
+            boundaries.append(i)
+            continue
+        
+        # Condition 3: Header after footer (clear document boundary)
+        if (current_page['has_header'] and not current_page['is_repeated_header'] and
+            previous_page['has_footer'] and 
+            current_page['is_likely_po']):
+            logger.info(
+                f"Page {i + 1}: ✓ NEW DOCUMENT - Header after footer pattern"
+            )
+            boundaries.append(i)
+            continue
     
-    logger.info(f"\n{'='*80}")
+    # Remove duplicates and sort
+    boundaries = sorted(set(boundaries))
+    
+    logger.info(f"\n{'='*70}")
     logger.info(f"DETECTED {len(boundaries)} DOCUMENT(S):")
     for idx, boundary in enumerate(boundaries):
         end_idx = boundaries[idx + 1] - 1 if idx + 1 < len(boundaries) else len(page_bytes_list) - 1
         logger.info(f"  Document {idx + 1}: Pages {boundary + 1} to {end_idx + 1}")
-    logger.info(f"{'='*80}\n")
+    logger.info(f"{'='*70}\n")
     
     return boundaries
 
 
-# Example integration with existing code:
-def detect_boundaries_full_pipeline(page_bytes_list: List[bytes],
-                                    use_di: bool = True,
-                                    di_cache=None,
-                                    structural_boundary_func=None) -> List[int]:
+def detect_boundaries_hybrid_enhanced(page_bytes_list: List[bytes],
+                                      use_di: bool = True,
+                                      di_cache=None,
+                                      existing_boundary_func=None) -> List[int]:
     """
-    Full pipeline: Structural detection + Translation-based order extraction
-    
-    Priority:
-    1. Structural detection (headers, footers, continuation)
-    2. Translation-based order number detection
-    3. Combine results
+    Enhanced hybrid boundary detection combining:
+    1. Primary: Traditional method (page numbers + PO numbers)
+    2. Secondary: Structure-based detection (headers + footers + continuation)
     
     Args:
         page_bytes_list: List of single-page PDF bytes
         use_di: Whether to use Document Intelligence
         di_cache: PageAnalysisCache instance
-        structural_boundary_func: Structural detection function
+        existing_boundary_func: Function to call for traditional boundary detection
         
     Returns:
-        List of page indices where documents start
+        List of page indices where new documents start
     """
     
-    logger.info(f"\n{'#'*80}")
-    logger.info(f"FULL PIPELINE: Structural + Translation-based Detection")
-    logger.info(f"{'#'*80}\n")
+    logger.info(f"\n{'#'*70}")
+    logger.info(f"HYBRID BOUNDARY DETECTION (Enhanced with repetition handling)")
+    logger.info(f"{'#'*70}\n")
     
     boundaries_set = {0}
     
-    # Step 1: Structural detection
-    if structural_boundary_func:
-        logger.info("Step 1: Running structural boundary detection...")
+    # Method 1: Traditional detection
+    if existing_boundary_func:
+        logger.info("Method 1: Traditional boundary detection (page numbers + PO numbers)...")
         try:
-            struct_boundaries = structural_boundary_func(page_bytes_list, di_cache)
-            boundaries_set.update(struct_boundaries)
-            logger.info(f"  ✓ Found {len(struct_boundaries) - 1} boundaries")
+            traditional_boundaries = existing_boundary_func(page_bytes_list, use_di=use_di)
+            boundaries_set.update(traditional_boundaries)
+            if len(traditional_boundaries) > 1:
+                logger.info(f"  ✓ Found {len(traditional_boundaries) - 1} boundaries")
         except Exception as e:
-            logger.warning(f"  Structural detection failed: {e}")
+            logger.warning(f"  Traditional detection failed: {e}")
     
-    # Step 2: Translation-based order detection
-    logger.info("\nStep 2: Running translation-enhanced order number detection...")
+    # Method 2: Structure-based detection (NOW WITH REPETITION HANDLING)
+    logger.info("\nMethod 2: Structure-based boundary detection (headers + footers + continuation)...")
     try:
-        translation_boundaries = detect_boundaries_with_translation(
-            page_bytes_list,
-            di_cache
+        structure_boundaries = detect_boundaries_by_structure(
+            page_bytes_list, 
+            di_cache=di_cache
         )
-        boundaries_set.update(translation_boundaries)
-        logger.info(f"  ✓ Found {len(translation_boundaries) - 1} boundaries")
+        boundaries_set.update(structure_boundaries)
+        if len(structure_boundaries) > 1:
+            logger.info(f"  ✓ Found {len(structure_boundaries) - 1} additional boundaries")
     except Exception as e:
-        logger.warning(f"  Translation detection failed: {e}")
+        logger.warning(f"  Structure detection failed: {e}")
     
     final_boundaries = sorted(list(boundaries_set))
     
-    logger.info(f"\n{'#'*80}")
-    logger.info(f"FINAL RESULT: {len(final_boundaries)} document(s)")
-    logger.info(f"{'#'*80}\n")
+    logger.info(f"\n{'#'*70}")
+    logger.info(f"FINAL RESULT: {len(final_boundaries)} document(s) detected")
+    logger.info(f"{'#'*70}\n")
     
     return final_boundaries
