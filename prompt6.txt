@@ -1,1165 +1,536 @@
-import concurrent.futures
-import hashlib
-import json
-import logging
-from logging.handlers import RotatingFileHandler
-import os
 import re
-import tempfile
-import threading
-import time
-from typing import Any, Dict, List, Optional, Tuple
-
-from azure.ai.formrecognizer import DocumentAnalysisClient
-from azure.core.credentials import AzureKeyCredential
-from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import fitz  # PyMuPDF
+import logging
+import json
+from typing import Dict, Any, List, Tuple, Optional
 from openai import AzureOpenAI
-from pydantic import BaseModel
-import uvicorn
+import hashlib
 
-# ============================================================================
-# GLOBAL SETTINGS AND INITIALIZATION
-# ============================================================================
-ROOT_DIR = r"PATH_TO_PO_FILES"
-DB_FILE = "user.db"
+logger = logging.getLogger(__name__)
 
-# Logging Configuration
-LOG_FILE = os.path.join(ROOT_DIR, "po_runtime.log")
-os.makedirs(ROOT_DIR, exist_ok=True)
-logger = logging.getLogger("po_runtime")
-logger.setLevel(logging.INFO)
+# Azure OpenAI Configuration
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "YOUR_ENDPOINT_HERE")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "YOUR_KEY_HERE")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")  # or "gpt-35-turbo"
 
-file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
-formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
-console = logging.StreamHandler()
-console.setFormatter(formatter)
-logger.addHandler(console)
-
-# Azure Resources
-document_client = DocumentAnalysisClient(
-    endpoint="YOUR_AZURE_ENDPOINT", 
-    credential=AzureKeyCredential("YOUR_AZURE_KEY")
+# Initialize Azure OpenAI Client
+openai_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version="2024-02-15-preview",
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
 
-# Azure OpenAI for translation
-azure_openai_client = AzureOpenAI(
-    azure_endpoint="YOUR_AZURE_OPENAI_ENDPOINT",
-    api_key="YOUR_AZURE_OPENAI_KEY",
-    api_version="2024-02-15-preview"
-)
 
-MAX_WORKERS = 3
-TRANSLATION_CACHE = {}  # Cache translations to avoid redundant API calls
-translation_lock = threading.Lock()
-
-# Rate limiting for API calls
-API_RATE_LIMITER = {
-    'last_call_time': 0,
-    'min_interval': 0.1,  # Minimum 100ms between calls
-    'lock': threading.Lock()
-}
-
-# ============================================================================
-# PYDANTIC MODELS
-# ============================================================================
-class POInfo(BaseModel):
-    filename: str
-    po_number: Optional[str]
-    extracted_data: Dict[str, Any]
-    page_count: int
-    page_range: str
-    original_languages: List[str]
-    processed_at: float
-    file_hash: str
-    sequence_number: int
-
-class ProcessingStatus(BaseModel):
-    total_files: int
-    processed_files: int
-    pending_files: int
-    recently_processed: List[str]
-    error_files: List[str]
-    is_running: bool
-
-class SplitResult(BaseModel):
-    original_filename: str
-    total_pos_found: int
-    po_files: List[Dict[str, Any]]
-    processing_time: float
-    metrics: Dict[str, Any]
-
-# ============================================================================
-# METRICS AND MONITORING
-# ============================================================================
-class POExtractionMetrics:
-    """Track extraction metrics for monitoring and debugging."""
+class TranslationCache:
+    """Cache for translation results to avoid redundant API calls."""
     
     def __init__(self):
-        self.total_files = 0
-        self.total_pages = 0
-        self.total_pos = 0
-        self.translation_calls = 0
-        self.extraction_failures = 0
-        self.processing_times = []
-        self.languages_detected = {}
-        self.lock = threading.Lock()
+        self.cache = {}
     
-    def record_extraction(self, pages: int, pos: int, time_sec: float, success: bool):
-        with self.lock:
-            self.total_files += 1
-            self.total_pages += pages
-            self.total_pos += pos
-            self.processing_times.append(time_sec)
-            if not success:
-                self.extraction_failures += 1
+    @staticmethod
+    def generate_cache_key(text: str, target_lang: str = "en") -> str:
+        """Generate cache key from text content."""
+        content = f"{text}_{target_lang}"
+        return hashlib.md5(content.encode()).hexdigest()
     
-    def record_translation(self, language: str):
-        with self.lock:
-            self.translation_calls += 1
-            self.languages_detected[language] = self.languages_detected.get(language, 0) + 1
+    def get(self, text: str, target_lang: str = "en") -> Optional[str]:
+        """Get cached translation."""
+        key = self.generate_cache_key(text, target_lang)
+        return self.cache.get(key)
     
-    def get_summary(self) -> Dict:
-        with self.lock:
-            avg_time = sum(self.processing_times) / len(self.processing_times) if self.processing_times else 0
-            failure_rate = self.extraction_failures / self.total_files if self.total_files > 0 else 0
-            
-            return {
-                'total_files_processed': self.total_files,
-                'total_pages_processed': self.total_pages,
-                'total_pos_extracted': self.total_pos,
-                'average_processing_time_sec': round(avg_time, 2),
-                'extraction_failure_rate': round(failure_rate, 3),
-                'translation_calls_made': self.translation_calls,
-                'languages_detected': self.languages_detected
-            }
-
-# Global metrics instance
-extraction_metrics = POExtractionMetrics()
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-def rate_limit_api_call():
-    """Ensure minimum interval between API calls."""
-    with API_RATE_LIMITER['lock']:
-        elapsed = time.time() - API_RATE_LIMITER['last_call_time']
-        if elapsed < API_RATE_LIMITER['min_interval']:
-            time.sleep(API_RATE_LIMITER['min_interval'] - elapsed)
-        API_RATE_LIMITER['last_call_time'] = time.time()
+    def set(self, text: str, translated: str, target_lang: str = "en"):
+        """Cache translation result."""
+        key = self.generate_cache_key(text, target_lang)
+        self.cache[key] = translated
+    
+    def clear(self):
+        """Clear cache."""
+        self.cache.clear()
 
 
-def retry_with_backoff(func, max_retries=3, initial_delay=1.0):
-    """Retry a function with exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            return func()
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = initial_delay * (2 ** attempt)
-            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
-            time.sleep(delay)
+# Global cache instance
+translation_cache = TranslationCache()
 
 
-# ============================================================================
-# AI TRANSLATION LAYER
-# ============================================================================
-
-def detect_language(text: str) -> str:
+class MultilingualOrderExtractor:
     """
-    Detect the language of the text using Azure OpenAI GPT-4.
-    Returns language code (e.g., 'es', 'de', 'zh', 'ja', 'en')
+    Extracts order identifiers (PO, Invoice numbers) from multilingual documents.
+    Supports: English, Spanish, French, German, Portuguese, Italian, etc.
     """
-    try:
-        rate_limit_api_call()
+    
+    # Order number patterns in different languages
+    ORDER_NUMBER_PATTERNS = {
+        'en': [
+            r'(?:ORDER|PO|PURCHASE ORDER|INVOICE|QUOTATION)\s*(?:NUMBER|NUM|NO\.?|ID)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:PO|PO\#|PONO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:ORDER\s*ID)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+        ],
+        'es': [
+            r'(?:PEDIDO|NUMERO DE PEDIDO|NUM PEDIDO|N[ÚU]MERO DE ORDEN|ORDEN)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:FACTURA|NUMERO DE FACTURA|NUM\s*FACTURA)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:COTIZACI[ÓO]N|PRESUPUESTO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+        ],
+        'fr': [
+            r'(?:COMMANDE|NUM[ÉE]RO DE COMMANDE|N°)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:FACTURE|NUM[ÉE]RO DE FACTURE)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:DEVIS|DEVIS NUM[ÉE]RO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+        ],
+        'de': [
+            r'(?:BESTELLUNG|BESTELLNUMMER|BESTELLNR\.?)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:RECHNUNGSNUMMER|RECHNUNGS NR\.?)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:ANGEBOT|ANGEBOTSNUMMER)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+        ],
+        'pt': [
+            r'(?:PEDIDO|NUMERO DO PEDIDO|NÚM\s*PEDIDO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:FATURA|NUMERO DA FATURA|NÚM\s*FATURA)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:COTAÇÃO|ORÇAMENTO|NÚMERO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+        ],
+        'it': [
+            r'(?:ORDINE|NUMERO ORDINE|N°ORDINE)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:FATTURA|NUMERO FATTURA|N°FATTURA)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+            r'(?:PREVENTIVO|NUMERO PREVENTIVO)\s*[:\s]*([A-Za-z0-9\-\/]+)',
+        ],
+    }
+    
+    # Keywords to identify order-related fields
+    ORDER_KEYWORDS = {
+        'en': ['order', 'po', 'purchase', 'invoice', 'quotation', 'quote', 'number', 'num', 'no', 'id'],
+        'es': ['pedido', 'factura', 'cotización', 'presupuesto', 'número', 'num', 'nro', 'orden'],
+        'fr': ['commande', 'facture', 'devis', 'numéro', 'num', 'n°'],
+        'de': ['bestellung', 'rechnung', 'angebot', 'nummer', 'nr', 'nro'],
+        'pt': ['pedido', 'fatura', 'cotação', 'número', 'num', 'nro', 'orçamento'],
+        'it': ['ordine', 'fattura', 'preventivo', 'numero', 'num', 'n°'],
+    }
+    
+    def __init__(self):
+        """Initialize the multilingual order extractor."""
+        self.supported_languages = list(self.ORDER_NUMBER_PATTERNS.keys())
+    
+    def detect_language(self, text: str) -> str:
+        """
+        Detect the language of the text.
         
-        def _detect():
-            response = azure_openai_client.chat.completions.create(
-                model="gpt-4o",  # Use your GPT-4o deployment name
+        Args:
+            text: Text to detect language from
+            
+        Returns:
+            Language code (e.g., 'es', 'en', 'fr')
+        """
+        try:
+            # Use Azure OpenAI to detect language
+            response = openai_client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a language detection expert. Respond with ONLY the ISO 639-1 language code (e.g., 'en', 'es', 'de', 'zh', 'ja', 'fr', 'it', 'pt', 'ru', 'ar', 'hi'). Nothing else."
+                        "content": "You are a language detection expert. Respond with ONLY the 2-letter ISO 639-1 language code (e.g., 'es', 'en', 'fr'). No explanation needed."
                     },
                     {
                         "role": "user",
-                        "content": f"Detect the language of this text:\n\n{text[:1000]}"
+                        "content": f"Detect the language of this text:\n\n{text[:500]}"
                     }
                 ],
-                temperature=0,
-                max_tokens=10
+                max_tokens=10,
+                temperature=0
             )
-            return response.choices[0].message.content.strip().lower()
+            
+            lang_code = response.choices[0].message.content.strip().lower()
+            logger.info(f"Detected language: {lang_code}")
+            return lang_code
         
-        language_code = retry_with_backoff(_detect)
-        logger.info(f"Detected language: {language_code}")
-        extraction_metrics.record_translation(language_code)
-        return language_code
-        
-    except Exception as e:
-        logger.error(f"Language detection error: {e}")
-        return "unknown"
-
-
-def translate_text_with_ai(text: str, source_lang: str = "auto", target_lang: str = "en") -> str:
-    """
-    Translate text to English using Azure OpenAI GPT-4o while preserving:
-    - Document structure
-    - Numbers, codes, and identifiers
-    - Field names and labels
-    - Table formatting
-    """
-    # Check cache first
-    cache_key = hashlib.md5(f"{text}{source_lang}{target_lang}".encode()).hexdigest()
+        except Exception as e:
+            logger.error(f"Language detection failed: {e}")
+            return 'en'  # Default to English
     
-    with translation_lock:
-        if cache_key in TRANSLATION_CACHE:
-            logger.info(f"Using cached translation for text hash: {cache_key[:8]}...")
-            return TRANSLATION_CACHE[cache_key]
-    
-    try:
-        rate_limit_api_call()
+    def translate_text(self, text: str, source_lang: Optional[str] = None, 
+                      target_lang: str = 'en') -> str:
+        """
+        Translate text using Azure OpenAI.
         
-        def _translate():
-            response = azure_openai_client.chat.completions.create(
-                model="gpt-4o",  # Use your GPT-4o deployment name
+        Args:
+            text: Text to translate
+            source_lang: Source language code (auto-detected if None)
+            target_lang: Target language code (default: 'en')
+            
+        Returns:
+            Translated text
+        """
+        # If already in target language, return as-is
+        if source_lang and source_lang == target_lang:
+            logger.debug(f"Text already in {target_lang}, skipping translation")
+            return text
+        
+        # Check cache
+        cached = translation_cache.get(text, target_lang)
+        if cached:
+            logger.debug(f"Using cached translation for {target_lang}")
+            return cached
+        
+        try:
+            logger.info(f"Translating text to {target_lang}...")
+            
+            response = openai_client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
                 messages=[
                     {
                         "role": "system",
-                        "content": """You are a professional document translator specializing in business documents (Purchase Orders, Invoices, etc.).
-
-CRITICAL RULES:
-1. Translate ALL text to English
-2. PRESERVE exactly as-is:
-   - All numbers (dates, amounts, quantities, codes)
-   - All alphanumeric identifiers (PO numbers, item codes, reference numbers)
-   - All special characters and formatting
-   - Table structures and layouts
-3. Translate field labels/headers but keep their position
-4. Maintain the exact document structure
-5. Do not add explanations or notes
-6. Return ONLY the translated text"""
+                        "content": f"You are a professional translator. Translate the following text to {target_lang}. Maintain formatting, line breaks, and special characters. Translate only the content, not labels or structure."
                     },
                     {
                         "role": "user",
-                        "content": f"Translate this document text from {source_lang} to English:\n\n{text}"
+                        "content": text
                     }
                 ],
-                temperature=0.3,
-                max_tokens=4000
+                max_tokens=4000,
+                temperature=0  # Deterministic translation
             )
-            return response.choices[0].message.content.strip()
-        
-        translated_text = retry_with_backoff(_translate)
-        
-        # Cache the translation
-        with translation_lock:
-            TRANSLATION_CACHE[cache_key] = translated_text
-        
-        logger.info(f"Translated text from {source_lang} to English ({len(text)} -> {len(translated_text)} chars)")
-        return translated_text
-        
-    except Exception as e:
-        logger.error(f"Translation error: {e}")
-        return text  # Return original text if translation fails
-
-
-def extract_and_translate_text(page_bytes: bytes) -> Tuple[str, str, Dict]:
-    """
-    Extract text from page and translate if needed.
-    Returns: (original_text, translated_text, metadata)
-    
-    This avoids expensive PDF reconstruction and maintains quality.
-    """
-    try:
-        # Extract text using Azure DI
-        rate_limit_api_call()
-        
-        def _extract():
-            poller = document_client.begin_analyze_document(
-                "prebuilt-layout",
-                page_bytes
-            )
-            return poller.result()
-        
-        result = retry_with_backoff(_extract)
-        
-        if not result.pages:
-            return "", "", {'error': 'no_pages'}
-        
-        page = result.pages[0]
-        
-        # Extract all text
-        page_text = "\n".join(line.content for line in page.lines) if hasattr(page, 'lines') else ""
-        
-        if not page_text.strip():
-            return "", "", {'error': 'no_text'}
-        
-        # Detect language
-        detected_lang = detect_language(page_text)
-        
-        # Only translate if not English
-        if detected_lang in ['en', 'unknown']:
-            return page_text, page_text, {
-                'language': detected_lang, 
-                'translated': False,
-                'original_length': len(page_text)
-            }
-        
-        # Translate text only (not the PDF!)
-        translated_text = translate_text_with_ai(page_text, detected_lang, "en")
-        
-        return page_text, translated_text, {
-            'language': detected_lang, 
-            'translated': True,
-            'original_length': len(page_text),
-            'translated_length': len(translated_text)
-        }
-        
-    except Exception as e:
-        logger.error(f"Error extracting/translating text: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return "", "", {'error': str(e)}
-
-
-# ============================================================================
-# PDF MANIPULATION
-# ============================================================================
-
-def split_pdf_pages(pdf_bytes: bytes) -> Optional[List[bytes]]:
-    """
-    Split a multi-page PDF into individual single-page PDFs.
-    Returns a list of byte arrays, each representing one page.
-    """
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        logger.info(f"Opening PDF: size={len(pdf_bytes)} bytes, pages={doc.page_count}")
-    except Exception as e:
-        logger.error(f"split_pdf_pages: Couldn't open PDF: {e}")
-        return None
-
-    page_byte_list = []
-    for page_num in range(doc.page_count):
-        single_pdf = fitz.open()
-        try:
-            single_pdf.insert_pdf(doc, from_page=page_num, to_page=page_num)
-            if single_pdf.page_count != 1:
-                logger.error(f"Failed to extract page {page_num} (got {single_pdf.page_count} pages)")
-                continue
-            buf = single_pdf.write()
-            page_byte_list.append(bytes(buf))
-        except Exception as e:
-            logger.error(f"split_pdf_pages: Couldn't extract page {page_num}: {e}")
-        finally:
-            single_pdf.close()
-    
-    doc.close()
-    logger.info(f"Successfully split PDF into {len(page_byte_list)} pages")
-    return page_byte_list
-
-
-def assemble_pdf_from_pages(page_bytes_group: List[bytes]) -> bytes:
-    """
-    Assemble multiple single-page PDFs into one multi-page PDF.
-    """
-    pdf = fitz.open()
-    
-    for idx, page_bytes in enumerate(page_bytes_group):
-        try:
-            single_doc = fitz.open(stream=page_bytes, filetype='pdf')
-            pdf.insert_pdf(single_doc, from_page=0, to_page=0)
-            single_doc.close()
-        except Exception as e:
-            logger.error(f"Error assembling page {idx}: {e}")
-    
-    out_bytes = pdf.write()
-    pdf.close()
-    return bytes(out_bytes)
-
-
-def validate_pdf(pdf_bytes: bytes) -> Tuple[bool, str]:
-    """
-    Validate PDF file before processing.
-    Returns: (is_valid, error_message)
-    """
-    try:
-        # Check file size
-        if len(pdf_bytes) == 0:
-            return False, "PDF file is empty"
-        
-        if len(pdf_bytes) > 100 * 1024 * 1024:  # 100MB limit
-            return False, "PDF file exceeds 100MB limit"
-        
-        # Try to open PDF
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        
-        # Check page count
-        if doc.page_count == 0:
-            doc.close()
-            return False, "PDF has no pages"
-        
-        if doc.page_count > 500:  # Reasonable limit
-            doc.close()
-            return False, "PDF has too many pages (>500)"
-        
-        doc.close()
-        return True, ""
-        
-    except Exception as e:
-        return False, f"PDF validation failed: {str(e)}"
-
-
-# ============================================================================
-# PO DETECTION AND EXTRACTION
-# ============================================================================
-
-def calculate_po_start_confidence(page_data: Dict) -> float:
-    """
-    Calculate confidence score (0-1) that a page is a PO start.
-    Uses multiple signals for robustness.
-    """
-    text = page_data.get('text', '').upper()
-    if not text:
-        return 0.0
-    
-    confidence = 0.0
-    
-    # Signal 1: Strong PO keywords in header (top 30% of text)
-    header_text = text[:len(text)//3] if len(text) > 100 else text
-    strong_indicators = ['PURCHASE ORDER', 'P.O. NUMBER', 'ORDER NUMBER', 'PO NUMBER']
-    if any(ind in header_text for ind in strong_indicators):
-        confidence += 0.5
-    
-    # Signal 2: Vendor/buyer information
-    vendor_indicators = ['VENDOR:', 'SUPPLIER:', 'BILL TO:', 'SHIP TO:', 'SOLD TO:']
-    if any(ind in header_text for ind in vendor_indicators):
-        confidence += 0.2
-    
-    # Signal 3: Date near top
-    if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', header_text):
-        confidence += 0.1
-    
-    # Signal 4: Table/line item structure
-    if 'QUANTITY' in text and 'DESCRIPTION' in text:
-        confidence += 0.15
-    
-    # Signal 5: Currency/pricing indicators
-    if re.search(r'\$|USD|EUR|TOTAL|AMOUNT', text):
-        confidence += 0.05
-    
-    return min(confidence, 1.0)
-
-
-def validate_boundaries(boundaries: List[Tuple[int, int]], 
-                       page_texts: List[Dict]) -> List[Tuple[int, int]]:
-    """
-    Validate and fix boundary issues (e.g., single-page POs, gaps).
-    """
-    validated = []
-    
-    for start, end in boundaries:
-        # Check for minimum page count
-        page_count = end - start + 1
-        if page_count < 1:
-            logger.warning(f"Invalid boundary: {start}-{end}, skipping")
-            continue
-        
-        # Check for text content
-        has_content = any(page_texts[i].get('text', '').strip() for i in range(start, min(end + 1, len(page_texts))))
-        if not has_content:
-            logger.warning(f"No content in pages {start}-{end}, skipping")
-            continue
-        
-        validated.append((start, end))
-    
-    return validated
-
-
-def detect_po_boundaries(page_bytes_list: List[bytes]) -> List[Tuple[int, int]]:
-    """
-    Enhanced boundary detection with validation and confidence scoring.
-    """
-    boundaries = []
-    current_start = 0
-    page_texts = []
-    
-    logger.info(f"Detecting PO boundaries for {len(page_bytes_list)} pages")
-    logger.info("=" * 80)
-    
-    # First pass: Extract and translate all text
-    for i, page_bytes in enumerate(page_bytes_list):
-        try:
-            logger.info(f"Processing page {i + 1}/{len(page_bytes_list)}...")
-            _, translated_text, metadata = extract_and_translate_text(page_bytes)
-            page_texts.append({
-                'index': i,
-                'text': translated_text,
-                'metadata': metadata
-            })
             
-            if metadata.get('translated'):
-                logger.info(f"  Page {i + 1}: Translated from {metadata.get('language', 'unknown')}")
-            else:
-                logger.info(f"  Page {i + 1}: Already in English")
-                
+            translated = response.choices[0].message.content.strip()
+            
+            # Cache the translation
+            translation_cache.set(text, translated, target_lang)
+            
+            logger.info(f"✓ Translation successful ({len(translated)} characters)")
+            return translated
+        
         except Exception as e:
-            logger.error(f"Error processing page {i}: {e}")
-            page_texts.append({'index': i, 'text': '', 'metadata': {'error': str(e)}})
+            logger.error(f"Translation failed: {e}")
+            return text  # Return original if translation fails
     
-    logger.info("=" * 80)
-    logger.info("Text extraction complete. Detecting boundaries...")
-    
-    # Second pass: Detect boundaries with confidence scoring
-    for i in range(len(page_texts)):
-        if i == 0:
-            continue  # First page is always a start
+    def extract_order_number_native(self, text: str, language: str) -> Optional[str]:
+        """
+        Extract order number using native language patterns.
         
-        confidence = calculate_po_start_confidence(page_texts[i])
+        Args:
+            text: Text to search (already in native language)
+            language: Language code
+            
+        Returns:
+            Order number if found, None otherwise
+        """
+        if language not in self.ORDER_NUMBER_PATTERNS:
+            logger.warning(f"Language {language} not supported, falling back to English patterns")
+            language = 'en'
         
-        if confidence > 0.6:  # Threshold for new PO detection
-            # End previous PO
-            boundaries.append((current_start, i - 1))
-            logger.info(f"✓ PO boundary detected: pages {current_start + 1}-{i} (confidence: {confidence:.2f})")
-            current_start = i
-        else:
-            logger.debug(f"  Page {i + 1}: Not a PO start (confidence: {confidence:.2f})")
-    
-    # Add final boundary
-    if current_start < len(page_texts):
-        boundaries.append((current_start, len(page_texts) - 1))
-        logger.info(f"✓ Final PO boundary: pages {current_start + 1}-{len(page_texts)}")
-    
-    # Validate boundaries
-    validated_boundaries = validate_boundaries(boundaries, page_texts)
-    
-    logger.info(f"Detected {len(validated_boundaries)} valid PO boundaries")
-    logger.info("=" * 80)
-    
-    return validated_boundaries, page_texts
-
-
-def validate_po_number_format(value: str) -> bool:
-    """
-    Validate that a string looks like a real PO number.
-    Filters out common false positives.
-    """
-    if not value or len(value) < 4 or len(value) > 30:
-        return False
-    
-    # Must contain at least one number
-    has_number = bool(re.search(r'\d', value))
-    if not has_number:
-        return False
-    
-    # Should be primarily alphanumeric with some allowed special chars
-    if not re.match(r'^[A-Z0-9\-_/\.]+$', value, re.IGNORECASE):
-        return False
-    
-    # Reject common false positives
-    false_positives = [
-        r'^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$',  # Dates
-        r'^[A-Z]{2,3}\d{1,3}$',  # State codes (e.g., CA1, TX99)
-        r'^\d+\.\d+$',  # Decimals
-        r'^\d{1,2}:\d{2}$',  # Times
-        r'^PAGE\s*\d+$',  # Page numbers
-    ]
-    
-    for pattern in false_positives:
-        if re.match(pattern, value, re.IGNORECASE):
-            return False
-    
-    return True
-
-
-def extract_po_number(page_bytes: bytes, page_text: str = None) -> Optional[str]:
-    """
-    Enhanced PO number extraction with multiple strategies and validation.
-    Uses both Azure DI and regex patterns for redundancy.
-    """
-    candidates = set()
-    
-    # Strategy 1: Azure DI custom model
-    try:
-        rate_limit_api_call()
-        
-        def _extract():
-            poller = document_client.begin_analyze_document(
-                "prebuilt-document",  # Replace with custom PO model name
-                page_bytes
-            )
-            return poller.result()
-        
-        result = retry_with_backoff(_extract)
-        
-        # Check specific PO fields
-        for doc in result.documents:
-            for key in ["PONumber", "PurchaseOrderNumber", "PO_Number", "OrderNumber"]:
-                val = doc.fields.get(key)
-                if val and hasattr(val, "value") and val.value:
-                    candidate = str(val.value).strip()
-                    if validate_po_number_format(candidate):
-                        candidates.add(candidate)
-        
-        # Check key-value pairs with PO-related keys
-        for kv_pair in result.key_value_pairs:
-            if kv_pair.key and kv_pair.value:
-                key_text = kv_pair.key.content.upper()
-                # More specific matching for PO-related keys
-                if any(term in key_text for term in ['PO', 'P.O', 'ORDER', 'PURCHASE']):
-                    value = kv_pair.value.content.strip()
-                    if validate_po_number_format(value):
-                        candidates.add(value)
-                        logger.debug(f"Found PO candidate via KV: {value} (key: {key_text})")
-    
-    except Exception as e:
-        logger.warning(f"Azure DI extraction failed: {e}")
-    
-    # Strategy 2: Regex patterns on translated text
-    if page_text:
-        patterns = [
-            r'(?:PO|P\.O\.|ORDER)\s*(?:NUMBER|NO\.?|#)?\s*:?\s*([A-Z0-9\-_/]{4,20})',
-            r'PURCHASE\s+ORDER\s*(?:NUMBER|NO\.?|#)?\s*:?\s*([A-Z0-9\-_/]{4,20})',
-            r'ORDER\s+NO\.?\s*:?\s*([A-Z0-9\-_/]{4,20})',
-        ]
+        patterns = self.ORDER_NUMBER_PATTERNS[language]
+        text_upper = text.upper()
         
         for pattern in patterns:
-            matches = re.finditer(pattern, page_text.upper())
-            for match in matches:
-                po_candidate = match.group(1).strip()
-                if validate_po_number_format(po_candidate):
-                    candidates.add(po_candidate)
-                    logger.debug(f"Found PO candidate via regex: {po_candidate}")
-    
-    # Return the most likely candidate
-    if candidates:
-        # Prefer longer, more complex numbers (more likely to be real PO numbers)
-        # Also prefer those with letters (alphanumeric is more common for POs)
-        def score_candidate(c):
-            length_score = len(c)
-            complexity_score = c.count('-') + c.count('_')
-            has_letters = bool(re.search(r'[A-Z]', c, re.IGNORECASE))
-            letter_score = 10 if has_letters else 0
-            return length_score + complexity_score + letter_score
+            match = re.search(pattern, text_upper, re.IGNORECASE)
+            if match:
+                order_num = match.group(1).strip()
+                logger.info(f"Found order number ({language}): {order_num}")
+                return order_num
         
-        best = max(candidates, key=score_candidate)
-        logger.info(f"✓ Extracted PO number: {best} (from {len(candidates)} candidates)")
-        return best
+        return None
     
-    logger.info("✗ No PO number found")
-    return None
-
-
-def extract_pos_from_pdf(pdf_bytes: bytes, 
-                        original_filename: str) -> Tuple[List[Tuple[bytes, str, Optional[str], str, Dict]], Dict[str, Any]]:
-    """
-    Improved PO extraction with better translation and validation.
-    
-    Returns: 
-        - List of (pdf_bytes, filename, po_number, page_range, metadata)
-        - Extraction metadata
-    """
-    logger.info("=" * 80)
-    logger.info(f"STARTING PO EXTRACTION: {original_filename}")
-    logger.info("=" * 80)
-    start_time = time.time()
-    
-    # Validate PDF first
-    is_valid, error_msg = validate_pdf(pdf_bytes)
-    if not is_valid:
-        logger.error(f"PDF validation failed: {error_msg}")
-        return [], {'error': error_msg, 'success': False}
-    
-    logger.info(f"✓ PDF validated: {len(pdf_bytes)} bytes")
-    
-    # Split into pages (original PDFs, no modification)
-    page_bytes_list = split_pdf_pages(pdf_bytes)
-    if not page_bytes_list:
-        logger.error("Failed to split PDF")
-        return [], {'error': 'Failed to split PDF', 'success': False}
-    
-    logger.info(f"✓ Split into {len(page_bytes_list)} pages")
-    
-    # Detect boundaries using translated text (but keep original PDFs)
-    try:
-        boundaries, page_texts = detect_po_boundaries(page_bytes_list)
-    except Exception as e:
-        logger.error(f"Error in boundary detection: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return [], {'error': f'Boundary detection failed: {str(e)}', 'success': False}
-    
-    if not boundaries:
-        logger.error("No PO boundaries detected")
-        return [], {'error': 'No PO boundaries detected', 'success': False}
-    
-    logger.info(f"✓ Detected {len(boundaries)} PO boundaries")
-    
-    # Process each PO group
-    po_files = []
-    base_name = os.path.splitext(original_filename)[0]
-    
-    for idx, (start, end) in enumerate(boundaries, 1):
+    def extract_from_di_result(self, di_result: Any, source_lang: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Extract and translate order identifiers from DI result.
+        
+        Args:
+            di_result: Document Intelligence result object
+            source_lang: Source language (auto-detect if None)
+            
+        Returns:
+            Dictionary with extracted order info and translations
+        """
+        result = {
+            'source_language': source_lang,
+            'detected_language': None,
+            'original_text': '',
+            'translated_text': '',
+            'order_numbers': {
+                'original': None,
+                'original_language': None,
+                'translated': None,
+                'source': 'di_result'  # Can be 'di_result', 'kv_pairs', 'regex'
+            },
+            'all_kv_pairs': {},
+            'translated_kv_pairs': {},
+            'confidence_score': 0.0
+        }
+        
+        if not di_result:
+            logger.warning("Empty DI result provided")
+            return result
+        
         try:
-            logger.info(f"\n--- Processing PO {idx}/{len(boundaries)} ---")
+            # Extract full content from DI
+            full_text = ""
+            if hasattr(di_result, 'content') and di_result.content:
+                full_text = di_result.content
             
-            # Get pages for this PO (original PDFs, not translated)
-            po_pages = page_bytes_list[start:end + 1]
+            result['original_text'] = full_text
             
-            # Get translated text from first page for PO number extraction
-            first_page_text = page_texts[start].get('text', '') if start < len(page_texts) else ''
+            # Detect language if not provided
+            detected_lang = source_lang
+            if not detected_lang and full_text:
+                detected_lang = self.detect_language(full_text[:500])
+                result['detected_language'] = detected_lang
             
-            # Extract PO number
-            po_number = extract_po_number(po_pages[0], first_page_text)
+            # Try to extract order number from original text (native language)
+            if full_text:
+                order_num = self.extract_order_number_native(full_text, detected_lang or 'en')
+                if order_num:
+                    result['order_numbers']['original'] = order_num
+                    result['order_numbers']['original_language'] = detected_lang
+                    result['order_numbers']['source'] = 'native_regex'
+                    result['confidence_score'] = 0.9
+                    logger.info(f"✓ Found order number in original language: {order_num}")
             
-            # Try second page if first fails and PO has multiple pages
-            if not po_number and len(po_pages) > 1 and (start + 1) < len(page_texts):
-                logger.info("  No PO number on first page, trying second page...")
-                second_page_text = page_texts[start + 1].get('text', '')
-                po_number = extract_po_number(po_pages[1], second_page_text)
+            # Extract key-value pairs from DI
+            if hasattr(di_result, 'key_value_pairs') and di_result.key_value_pairs:
+                for kv in di_result.key_value_pairs:
+                    if kv.key and kv.value:
+                        key_text = kv.key.content if kv.key.content else ""
+                        value_text = kv.value.content if kv.value.content else ""
+                        
+                        if key_text and value_text:
+                            result['all_kv_pairs'][key_text] = value_text
             
-            # Assemble PDF from original pages
-            po_pdf_bytes = assemble_pdf_from_pages(po_pages)
-            
-            # Generate filename
-            if po_number:
-                safe_po = re.sub(r'[^\w\-]', '_', po_number)
-                filename = f"{base_name}_PO{idx:03d}_{safe_po}.pdf"
+            # Translate content and KV pairs to English
+            if detected_lang and detected_lang != 'en' and full_text:
+                logger.info(f"Document in {detected_lang}, translating to English...")
+                
+                translated_text = self.translate_text(full_text, detected_lang, 'en')
+                result['translated_text'] = translated_text
+                
+                # Extract order number from translated text
+                if not result['order_numbers']['original']:
+                    order_num_translated = self.extract_order_number_native(
+                        translated_text, 
+                        'en'
+                    )
+                    if order_num_translated:
+                        result['order_numbers']['translated'] = order_num_translated
+                        result['order_numbers']['source'] = 'translated_regex'
+                        result['confidence_score'] = 0.85
+                        logger.info(f"✓ Found order number in translation: {order_num_translated}")
+                
+                # Translate KV pairs
+                if result['all_kv_pairs']:
+                    kv_text = "\n".join([f"{k}: {v}" for k, v in result['all_kv_pairs'].items()])
+                    translated_kv = self.translate_text(kv_text, detected_lang, 'en')
+                    
+                    # Parse translated KV pairs
+                    for line in translated_kv.split('\n'):
+                        if ':' in line:
+                            k, v = line.split(':', 1)
+                            result['translated_kv_pairs'][k.strip()] = v.strip()
             else:
-                filename = f"{base_name}_PO{idx:03d}_Unknown.pdf"
+                result['translated_text'] = full_text
+                result['translated_kv_pairs'] = result['all_kv_pairs']
             
-            page_range = f"{start + 1}-{end + 1}"
-            
-            # Collect languages for this PO
-            po_languages = []
-            for page_idx in range(start, end + 1):
-                if page_idx < len(page_texts):
-                    lang = page_texts[page_idx].get('metadata', {}).get('language', 'unknown')
-                    po_languages.append(lang)
-            
-            metadata = {
-                'page_count': len(po_pages),
-                'sequence': idx,
-                'total_pos': len(boundaries),
-                'languages': list(set(po_languages)),
-                'file_size': len(po_pdf_bytes)
-            }
-            
-            po_files.append((po_pdf_bytes, filename, po_number, page_range, metadata))
-            
-            logger.info(f"✓ Created: {filename}")
-            logger.info(f"  - Pages: {page_range} ({len(po_pages)} pages)")
-            logger.info(f"  - PO Number: {po_number if po_number else 'Not detected'}")
-            logger.info(f"  - Languages: {', '.join(set(po_languages))}")
-            logger.info(f"  - Size: {len(po_pdf_bytes):,} bytes")
-            
+            return result
+        
         except Exception as e:
-            logger.error(f"Error processing PO {idx}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            # Continue with next PO even if this one fails
+            logger.error(f"Error in extract_from_di_result: {e}")
+            return result
     
-    elapsed = time.time() - start_time
-    
-    extraction_meta = {
-        'success': len(po_files) > 0,
-        'total_pages': len(page_bytes_list),
-        'total_pos': len(po_files),
-        'processing_time_sec': round(elapsed, 2),
-        'boundaries_detected': len(boundaries),
-        'languages_found': list(set(lang for pt in page_texts for lang in [pt.get('metadata', {}).get('language', 'unknown')]))
-    }
-    
-    logger.info("=" * 80)
-    logger.info(f"EXTRACTION COMPLETE: {len(po_files)} POs extracted in {elapsed:.2f}s")
-    logger.info("=" * 80)
-    
-    # Record metrics
-    extraction_metrics.record_extraction(
-        pages=len(page_bytes_list),
-        pos=len(po_files),
-        time_sec=elapsed,
-        success=len(po_files) > 0
-    )
-    
-    return po_files, extraction_meta
-
-
-# ============================================================================
-# FILE PROCESSING AND DATA EXTRACTION
-# ============================================================================
-
-def calculate_file_hash(content: bytes) -> str:
-    """Calculate SHA-256 hash of file content."""
-    return hashlib.sha256(content).hexdigest()
-
-
-def get_user_directories(user_directory: str) -> Dict[str, str]:
-    """Get or create user-specific directories."""
-    sanitized = re.sub(r'\W+', '_', user_directory)
-    base = os.path.join(ROOT_DIR, "user_data", sanitized)
-    upload = os.path.join(base, "PO_data")
-    extracted = os.path.join(base, "Extracted_data")
-    seq_file = os.path.join(base, "sequence_mapping.json")
-    
-    for d in [upload, extracted]:
-        os.makedirs(d, exist_ok=True)
-    
-    return {
-        "base": base,
-        "upload": upload,
-        "extracted": extracted,
-        "sequence_file": seq_file
-    }
-
-
-def save_po_file(file_content: bytes, filename: str, dirs: Dict[str, str]) -> str:
-    """Save PO file to user's upload directory."""
-    file_path = os.path.join(dirs["upload"], filename)
-    with open(file_path, 'wb') as f:
-        f.write(file_content)
-    logger.info(f"Saved PO file: {file_path}")
-    return file_path
-
-
-def extract_po_data(file_content: bytes, filename: str, dirs: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Extract structured data from a PO using Azure Document Intelligence.
-    """
-    extract_file_path = os.path.join(dirs["extracted"], f"{os.path.splitext(filename)[0]}_extracted.json")
-    
-    # Check if already extracted
-    if os.path.exists(extract_file_path):
-        try:
-            with open(extract_file_path, 'r') as f:
-                logger.info(f"Using cached extraction: {extract_file_path}")
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Error reading existing extracted file: {e}")
-    
-    try:
-        rate_limit_api_call()
+    def identify_order_field_in_kv(self, kv_pairs: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Identify order number field from translated KV pairs.
+        Matches common order number field names.
         
-        # Analyze document with Azure DI
-        def _analyze():
-            poller = document_client.begin_analyze_document(
-                "prebuilt-document",  # Or use custom PO model
-                file_content
-            )
-            return poller.result()
-        
-        result = retry_with_backoff(_analyze)
-        
-        # Extract fields
-        extracted_fields = {}
-        for doc in result.documents:
-            for field_name, field_value in doc.fields.items():
-                if hasattr(field_value, 'value') and field_value.value is not None:
-                    extracted_fields[field_name] = str(field_value.value)
-        
-        # Extract tables
-        extracted_tables = []
-        for table_idx, table in enumerate(result.tables):
-            table_data = []
-            for row_idx in range(table.row_count):
-                row_data = []
-                for col_idx in range(table.column_count):
-                    cell_text = ""
-                    for cell in table.cells:
-                        if cell.row_index == row_idx and cell.column_index == col_idx:
-                            cell_text = cell.content
-                            break
-                    row_data.append(cell_text)
-                table_data.append(row_data)
+        Args:
+            kv_pairs: Key-value pairs (should be in English)
             
-            extracted_tables.append({
-                "table_index": table_idx,
-                "data": table_data,
-                "row_count": table.row_count,
-                "column_count": table.column_count
-            })
+        Returns:
+            Tuple of (key, value) if found, (None, None) otherwise
+        """
+        order_keywords = self.ORDER_KEYWORDS['en']
         
-        # Extract key-value pairs
-        key_value_pairs = []
-        for kv_pair in result.key_value_pairs:
-            if kv_pair.key and kv_pair.value:
-                key_value_pairs.append({
-                    "key": kv_pair.key.content,
-                    "value": kv_pair.value.content
-                })
+        for key, value in kv_pairs.items():
+            key_lower = key.lower()
+            
+            # Check how many keywords match this key
+            keyword_matches = sum(1 for kw in order_keywords if kw in key_lower)
+            
+            if keyword_matches >= 1:
+                logger.info(f"✓ Identified order field: '{key}' = '{value}'")
+                return key, value
         
-        extracted_data = {
-            "fields": extracted_fields,
-            "tables": extracted_tables,
-            "key_value_pairs": key_value_pairs,
-            "document_type": result.documents[0].doc_type if result.documents else "Unknown"
-        }
-        
-        # Save extracted data
-        with open(extract_file_path, 'w') as f:
-            json.dump(extracted_data, f, default=str, indent=2)
-        
-        logger.info(f"✓ Extracted data saved: {extract_file_path}")
-        return extracted_data
-        
-    except Exception as e:
-        logger.error(f"Error extracting PO data: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return {"error": str(e)}
+        return None, None
 
 
-def process_single_po(po_bytes: bytes, po_filename: str, po_number: Optional[str], 
-                      sequence_num: int, page_range: str, original_languages: List[str],
-                      dirs: Dict[str, str]) -> POInfo:
-    """Process a single PO file and return POInfo."""
-    
-    logger.info(f"Processing PO {sequence_num}: {po_filename}")
-    
-    # Save file
-    save_po_file(po_bytes, po_filename, dirs)
-    
-    # Calculate hash
-    file_hash = calculate_file_hash(po_bytes)
-    
-    # Extract data (from translated PDF)
-    extracted_data = extract_po_data(po_bytes, po_filename, dirs)
-    
-    # Count pages
-    try:
-        doc = fitz.open(stream=po_bytes, filetype="pdf")
-        page_count = doc.page_count
-        doc.close()
-    except:
-        page_count = 0
-    
-    logger.info(f"✓ Processed: {po_filename} ({page_count} pages, hash: {file_hash[:8]}...)")
-    
-    return POInfo(
-        filename=po_filename,
-        po_number=po_number,
-        extracted_data=extracted_data,
-        page_count=page_count,
-        page_range=page_range,
-        original_languages=original_languages,
-        processed_at=time.time(),
-        file_hash=file_hash,
-        sequence_number=sequence_num
-    )
-
-
-# ============================================================================
-# FASTAPI APPLICATION
-# ============================================================================
-
-app = FastAPI(
-    title="Multi-PO PDF Extraction API",
-    description="API for splitting multi-PO PDFs and extracting structured data",
-    version="2.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "service": "Multi-PO PDF Extraction API",
-        "version": "2.0.0",
-        "status": "running",
-        "endpoints": {
-            "split_and_process": "/api/split-and-process-pos",
-            "metrics": "/api/metrics",
-            "health": "/api/health"
-        }
-    }
-
-
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint."""
-    try:
-        # Test Azure connections
-        test_bytes = b"test"
-        # Quick validation without actual API calls
-        return {
-            "status": "healthy",
-            "timestamp": time.time(),
-            "services": {
-                "azure_di": "available",
-                "azure_openai": "available"
-            }
-        }
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": str(e)
-            }
-        )
-
-
-@app.get("/api/metrics")
-async def get_metrics():
-    """Get extraction metrics."""
-    return extraction_metrics.get_summary()
-
-
-@app.post("/api/split-and-process-pos")
-async def split_and_process_pos(
-    file: UploadFile = File(...),
-    user_id: str = "default_user"
-):
+def extract_po_number_with_translation(page_bytes: bytes, 
+                                       di_result: Any,
+                                       source_language: Optional[str] = None) -> Tuple[Optional[str], str]:
     """
-    Upload a multi-PO PDF and split it into individual PO files.
-    Each PO is processed and data is extracted.
+    Extract PO number with translation support.
     
     Args:
-        file: Multi-PO PDF file
-        user_id: User identifier for organizing files
+        page_bytes: Page bytes (for fallback regex)
+        di_result: Document Intelligence result
+        source_language: Source language hint (auto-detect if None)
         
     Returns:
-        SplitResult with extracted POs and metadata
+        Tuple of (order_number, extraction_method)
+        Methods: 'translated_kv', 'native_regex', 'translated_regex', 'fallback', None
     """
-    start_time = time.time()
+    extractor = MultilingualOrderExtractor()
     
-    try:
-        # Validate file type
-        if not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="File must be a PDF")
-        
-        # Read uploaded file
-        pdf_bytes = await file.read()
-        original_filename = file.filename
-        
-        logger.info(f"Received file: {original_filename}, size: {len(pdf_bytes):,} bytes from user: {user_id}")
-        
-        # Get user directories
-        dirs = get_user_directories(user_id)
-        
-        # Extract POs from PDF
-        po_files, extraction_meta = extract_pos_from_pdf(pdf_bytes, original_filename)
-        
-        if not po_files:
-            error_msg = extraction_meta.get('error', 'No POs found in PDF')
-            raise HTTPException(status_code=400, detail=error_msg)
-        
-        # Process each PO (in sequential order)
-        processed_pos = []
-        for idx, (po_bytes, po_filename, po_number, page_range, metadata) in enumerate(po_files, 1):
-            try:
-                original_langs = metadata.get('languages', ['unknown'])
-                
-                po_info = process_single_po(
-                    po_bytes, po_filename, po_number, idx, 
-                    page_range, original_langs, dirs
-                )
-                
-                processed_pos.append({
-                    "sequence": idx,
-                    "filename": po_info.filename,
-                    "po_number": po_info.po_number,
-                    "page_range": page_range,
-                    "page_count": po_info.page_count,
-                    "original_languages": original_langs,
-                    "file_hash": po_info.file_hash,
-                    "file_size_bytes": metadata.get('file_size', 0),
-                    "has_extracted_data": "error" not in po_info.extracted_data
-                })
-                logger.info(f"Successfully processed PO {idx}/{len(po_files)}")
-            except Exception as e:
-                logger.error(f"Error processing PO {po_filename}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                processed_pos.append({
-                    "sequence": idx,
-                    "filename": po_filename,
-                    "page_range": page_range,
-                    "error": str(e)
-                })
-        
-        processing_time = time.time() - start_time
-        
-        result = SplitResult(
-            original_filename=original_filename,
-            total_pos_found=len(po_files),
-            po_files=processed_pos,
-            processing_time=processing_time,
-            metrics=extraction_meta
-        )
-        
-        logger.info(f"✓ API request complete: {len(po_files)} POs in {processing_time:.2f}s")
-        
-        return result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in split_and_process_pos: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/validate-pdf")
-async def validate_pdf_endpoint(file: UploadFile = File(...)):
-    """
-    Validate a PDF file before processing.
-    """
-    try:
-        pdf_bytes = await file.read()
-        is_valid, error_msg = validate_pdf(pdf_bytes)
-        
-        if is_valid:
-            # Get basic info
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            page_count = doc.page_count
-            doc.close()
-            
-            return {
-                "valid": True,
-                "filename": file.filename,
-                "size_bytes": len(pdf_bytes),
-                "page_count": page_count
-            }
-        else:
-            return {
-                "valid": False,
-                "error": error_msg
-            }
-    except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "valid": False,
-                "error": str(e)
-            }
-        )
-
-
-if __name__ == "__main__":
-    logger.info("Starting Multi-PO PDF Extraction API...")
-    logger.info(f"Root directory: {ROOT_DIR}")
-    logger.info(f"Log file: {LOG_FILE}")
-    logger.info("=" * 80)
+    # Extract and translate
+    extraction_data = extractor.extract_from_di_result(di_result, source_language)
     
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        log_config=None  # Use our custom logging
+    # Check for order number in various places
+    if extraction_data['order_numbers']['original']:
+        return (
+            extraction_data['order_numbers']['original'],
+            f"{extraction_data['order_numbers']['source']} ({extraction_data['detected_language']})"
+        )
+    
+    if extraction_data['order_numbers']['translated']:
+        return (
+            extraction_data['order_numbers']['translated'],
+            f"{extraction_data['order_numbers']['source']} (from translation)"
+        )
+    
+    # Check translated KV pairs for order fields
+    if extraction_data['translated_kv_pairs']:
+        key, value = extractor.identify_order_field_in_kv(extraction_data['translated_kv_pairs'])
+        if key and value:
+            return value.strip(), f"translated_kv_pair ({key})"
+    
+    # Fallback to regex on original text
+    order_num = extractor.extract_order_number_native(
+        extraction_data['original_text'],
+        extraction_data['detected_language'] or 'en'
     )
+    if order_num:
+        return order_num, f"native_regex ({extraction_data['detected_language']})"
+    
+    logger.warning("Could not extract order number even with translation")
+    return None, "not_found"
+
+
+def detect_boundaries_with_translation(page_bytes_list: List[bytes],
+                                       di_cache=None) -> List[int]:
+    """
+    Detect document boundaries using translation-enhanced order number extraction.
+    
+    Combines structural detection with multilingual order number identification.
+    
+    Args:
+        page_bytes_list: List of single-page PDF bytes
+        di_cache: PageAnalysisCache instance
+        
+    Returns:
+        List of page indices where new documents start
+    """
+    boundaries = [0]
+    last_order_number = None
+    last_language = None
+    
+    logger.info(f"\n{'='*80}")
+    logger.info(f"BOUNDARY DETECTION WITH TRANSLATION SUPPORT")
+    logger.info(f"Analyzing {len(page_bytes_list)} pages...")
+    logger.info(f"{'='*80}\n")
+    
+    for i, page_bytes in enumerate(page_bytes_list):
+        logger.info(f"Page {i + 1}/{len(page_bytes_list)}: Analyzing with translation...")
+        
+        # Get DI result
+        di_result = None
+        if di_cache:
+            di_result = di_cache.get(page_bytes)
+        
+        if not di_result:
+            logger.warning(f"  No DI result available for page {i + 1}")
+            continue
+        
+        # Extract order number with translation
+        order_num, extraction_method = extract_po_number_with_translation(
+            page_bytes,
+            di_result
+        )
+        
+        if order_num:
+            logger.info(f"  ✓ Order number found: {order_num}")
+            logger.info(f"    Extraction method: {extraction_method}")
+            
+            # Check if order number changed
+            if last_order_number is None:
+                last_order_number = order_num
+                logger.info(f"    First order number: {order_num}")
+            elif order_num != last_order_number and i > 0:
+                logger.info(
+                    f"  ✓ NEW DOCUMENT - Order number changed\n"
+                    f"    Previous: {last_order_number}\n"
+                    f"    Current: {order_num}"
+                )
+                boundaries.append(i)
+                last_order_number = order_num
+            else:
+                logger.info(f"    Same order number, continuing document")
+        else:
+            logger.info(f"  ⚠ Order number not found")
+    
+    logger.info(f"\n{'='*80}")
+    logger.info(f"DETECTED {len(boundaries)} DOCUMENT(S):")
+    for idx, boundary in enumerate(boundaries):
+        end_idx = boundaries[idx + 1] - 1 if idx + 1 < len(boundaries) else len(page_bytes_list) - 1
+        logger.info(f"  Document {idx + 1}: Pages {boundary + 1} to {end_idx + 1}")
+    logger.info(f"{'='*80}\n")
+    
+    return boundaries
+
+
+# Example integration with existing code:
+def detect_boundaries_full_pipeline(page_bytes_list: List[bytes],
+                                    use_di: bool = True,
+                                    di_cache=None,
+                                    structural_boundary_func=None) -> List[int]:
+    """
+    Full pipeline: Structural detection + Translation-based order extraction
+    
+    Priority:
+    1. Structural detection (headers, footers, continuation)
+    2. Translation-based order number detection
+    3. Combine results
+    
+    Args:
+        page_bytes_list: List of single-page PDF bytes
+        use_di: Whether to use Document Intelligence
+        di_cache: PageAnalysisCache instance
+        structural_boundary_func: Structural detection function
+        
+    Returns:
+        List of page indices where documents start
+    """
+    
+    logger.info(f"\n{'#'*80}")
+    logger.info(f"FULL PIPELINE: Structural + Translation-based Detection")
+    logger.info(f"{'#'*80}\n")
+    
+    boundaries_set = {0}
+    
+    # Step 1: Structural detection
+    if structural_boundary_func:
+        logger.info("Step 1: Running structural boundary detection...")
+        try:
+            struct_boundaries = structural_boundary_func(page_bytes_list, di_cache)
+            boundaries_set.update(struct_boundaries)
+            logger.info(f"  ✓ Found {len(struct_boundaries) - 1} boundaries")
+        except Exception as e:
+            logger.warning(f"  Structural detection failed: {e}")
+    
+    # Step 2: Translation-based order detection
+    logger.info("\nStep 2: Running translation-enhanced order number detection...")
+    try:
+        translation_boundaries = detect_boundaries_with_translation(
+            page_bytes_list,
+            di_cache
+        )
+        boundaries_set.update(translation_boundaries)
+        logger.info(f"  ✓ Found {len(translation_boundaries) - 1} boundaries")
+    except Exception as e:
+        logger.warning(f"  Translation detection failed: {e}")
+    
+    final_boundaries = sorted(list(boundaries_set))
+    
+    logger.info(f"\n{'#'*80}")
+    logger.info(f"FINAL RESULT: {len(final_boundaries)} document(s)")
+    logger.info(f"{'#'*80}\n")
+    
+    return final_boundaries
