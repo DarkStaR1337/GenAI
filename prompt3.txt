@@ -1,289 +1,403 @@
-import json
-import sqlite3
-import pandas as pd
-from datetime import datetime, timedelta
-from langchain_aws import ChatBedrockConverse
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+# Edge Case Analysis: PO Extraction System
 
-def graph_query(query):
-    """Check if query contains graph-related keywords"""
-    graph_keywords = ["bar", "pie", "graph", "chart", "draw", "visualize", "visualise"]
-    for keyword in graph_keywords:
-        if keyword in query.lower():
-            return True, keyword
-    return False, None
+## Edge Case 1: Cover Page Before PO (Orphaned Page Problem)
 
-def df_to_db(df, db_name):
-    """Convert DataFrame to SQLite database"""
-    try:
-        # Convert list columns to JSON strings
-        for col in df.columns:
-            if df[col].apply(lambda x: isinstance(x, list)).any():
-                df[col] = df[col].apply(json.dumps)
-        
-        # Create the connection to the database
-        con = sqlite3.connect(db_name)
-        try:
-            # Write the dataframe to the SQL table, replacing it if it already exists
-            df.to_sql("my_table", con, if_exists="replace", index=False)
-        finally:
-            # Ensure the connection is closed even if an exception occurs
-            con.close()
-    except Exception as e:
-        raise Exception(status_code=500, detail=str(e))
+### Current Behavior
+The system will **incorrectly treat the cover page as a separate document** because:
+- The cover page lacks PO number, so it won't match the boundary detection logic
+- It gets grouped as its own document (Document 1)
+- The actual PO starts at Document 2
 
-def graph_json(user_query, df, db_name):
-    """Process queries and generate responses using AWS Bedrock"""
-    try:
-        df_to_db(df, db_name)
-        dburi = f"sqlite:///{db_name}"
-        
-        # Initialize AWS Bedrock chat model
-        chat_model = ChatBedrockConverse(
-            model="amazon.nova-lite-v1:0",
-            region_name="us-east-1",  # Change to your preferred region
-            temperature=0.1,
-            max_tokens=1000,
-        )
-        
-        # Create SQL generation chain
-        sql_prompt = PromptTemplate.from_template(
-            "Simplify the above question, to create a correct SQL query. "
-            "Remove extra information which is not needed for an SQL query. "
-            "Just return the SQL query without any additional text.\n\nQuestion: {question}"
-        )
-        
-        # Create the answer prompt template
-        answer_prompt = PromptTemplate.from_template("""
-Given the following user question, corresponding SQL query, and SQL result, answer the user question.
-If the SQLResult is empty, the Answer should be "No Data Found".
-The SQL Result should be always returned in form of two dimensions: a string-based category and a numeric value with corresponding axis name.
-Create a two dimensional JSON list each having category and value with the corresponding label. DO NOT ADD any extra content in the response.
-Question: {question}
-SQL Query: {query}
-SQL Result: {result}
-Answer:
-""")
-        
-        # Create the chain using RunnablePassthrough
-        def execute_query(inputs):
-            """Execute SQL query and return results"""
-            try:
-                con = sqlite3.connect(db_name)
-                result = pd.read_sql_query(inputs["query"], con)
-                con.close()
-                return result.to_dict('records') if not result.empty else []
-            except Exception as e:
-                return f"SQL Error: {str(e)}"
-        
-        chain = (
-            RunnablePassthrough.assign(query=sql_prompt | chat_model | StrOutputParser())
-            .assign(result=lambda x: execute_query(x))
-            | answer_prompt
-            | chat_model
-            | StrOutputParser()
-        )
-        
-        response = chain.invoke({"question": user_query})
-        return response
-        
-    except Exception as e:
-        raise Exception(status_code=500, detail=str(e))
+**Example Scenario:**
+```
+Input PDF:
+  Page 1: Cover page (brochure, text-heavy, no PO number)
+  Page 2: PO with "Page 1 of 3"
+  Page 3: PO with "Page 2 of 3"
+  Page 4: PO with "Page 3 of 3"
 
-def get_offenses_response(query):
-    """Main function to handle offense-related queries"""
+Current Output:
+  Document 1: Page 1 only (cover - wrong!)
+  Document 2: Pages 2-4 (actual PO)
+```
+
+### Root Cause
+The boundary detection algorithm:
+1. Always starts with `boundaries = [0]` (first page always starts a document)
+2. Only adds new boundaries when it detects "Page 1" or PO number changes
+3. Orphaned cover pages get assigned to their own group
+
+### Recommended Solutions
+
+#### Solution A: Orphaned Page Merging (Recommended)
+**Merge orphaned pages (pages without PO/page numbers) with the next document:**
+
+```python
+def merge_orphaned_pages(groups: List[Dict[str, Any]], 
+                         page_bytes_list: List[bytes],
+                         use_di: bool = True) -> List[Dict[str, Any]]:
+    """
+    Merge pages without PO numbers/page numbers with the next document.
+    Identifies 'orphaned' pages and attaches them to the following document.
+    """
+    merged_groups = []
+    i = 0
     
-    # Sample data setup (replace with your actual data loading)
-    # client = get_next_client()  # Your data client
-    # if client == "llm1":
-    #     llm = llm2
-    # else:
-    #     llm = llm3
-    # llm = llm2
-    
-    # Time-based filtering logic
-    dict1 = {
-        "last_day": "yesterday",
-        "last_week": "last 7 days",
-        "last_month": "last 30 days",
-    }
-    
-    # Load your offenses dataframe
-    # df_offenses = get_jubilent_offense()  # Your data loading function
-    # df_offenses = pd.read_excel("jubilent/offenses_start.xlsx")  # Example
-    
-    # For demo purposes, creating a sample DataFrame
-    # Replace this with your actual data loading logic
-    df_offenses = pd.DataFrame({
-        'id': range(1, 101),
-        'description': ['Sample offense ' + str(i) for i in range(1, 101)],
-        'status': ['OPEN'] * 50 + ['CLOSED'] * 50,
-        'start_time': pd.date_range('2024-01-01', periods=100, freq='D'),
-        'close_time': pd.date_range('2024-01-15', periods=100, freq='D'),
-        'severity': ['Low', 'Medium', 'High', 'Critical'] * 25,
-        'categories': [['network', 'security']] * 100,
-        'assigned_to': ['user' + str(i % 10) for i in range(100)]
-    })
-    
-    custom_prompt_off = """
-You are working with a Whole DataFrame containing various details about offenses. Some of the columns are:
-1. id: Unique identifier for the offense.
-2. description: Text description of the offense.
-3. status: Current status of the offense (e.g., OPEN, CLOSED).
-4. rules: List of rules (ID and type) related to the offense.
-5. assigned_to: Email/identifier of the person assigned to the offense.
-6. closing_user: Email/identifier of the user who closed the offense.
-7. close_time: Timestamp when the offense was closed(dd-month-year).
-8. start_time: Timestamp when the offense started(dd-month-year).
-9. magnitude: Severity of the offense.
-10. categories: List of categories under which the offense falls.
-11. severity: Severity level of the offense(Low severity, Medium severity, High severity, Critical severity).
-12. closing_reason_id: Identifier for the reason the offense was closed(Benign True Positive ,True Positive, False Positive, Non-Issue, No Response Received,Policy Violation).
-13. offense_type: Type of offense.
-14. relevance: Relevance score of the offense.
-When asked to provide information, ensure you consider all relevant columns and provide correct data.
-**Do not consider sample or dummy data on your own.**
-
-2. Examples:
-
-Question: "How many offenses occurred in the last week?"
-Thought: Filter the DataFrame for rows where 'start_time' is within the last 7 days.Filter the null values and Return the count of offenses.
-Action: Perform the filtering and counting, then return the result.
-
-Question:"Give me all details of offense id 28433"
-Thought: Filter the DataFrame for rows where 'id' is '28433'. Return the data in 'description','categories','assigned_to','start_time','close_time','magnitude','severity'.
-Action: Perform the filtering and counting, then return the result.
-
-Question: "Offenses created last week"
-Thought: Filter the DataFrame for rows where 'start_time' is of last 7 days. Return the offenses for that 7 days.
-Action: Perform the filtering and counting, then return the result.
-
-Question: "What is the average time to close an offense?"
-Thought: Filter the DataFrame for rows 'close_time'. Return the mean/average of the time in minutes.
-Action: Perform the filtering and counting, then return the result.
-
-Question: "Can you give the recipe for Pizza?"
-Thought: This question is irrelevant to the DataFrame. Respond appropriately.
-Final Answer: "Sorry, I can only help with queries related to offenses."
-
-3. GUIDELINES:
-Make proper python code with proper imports and run correctly. Return only the answer.
-ALWAYS query from the dataframe provided. There is no csv file or sample data.
-ALWAYS Follow the [dict1] for answering to the time frame queries.(last week, last month, last 3 days etc.)
-If the query mentions "last week" ALWAYS use the following: start_date_last_week = current_date - timedelta(days=7); end_date_last_week = current_date - timedelta(days=1).
-Filter null values and count the correct count.
-Expectation is to have the consistent fields description, categories, created time, assigned_to, status if offense is closed then closure time and the closure code as well.
-Understand the terms yesterday/last day, today, last week, last month. last 3 days, Rules of the month effectively. Example:- last 14 days=last 2 weeks.
-Do consider the similar dates for "time queries". Do NOT HALLUCINATE.
-Understand that(dd-month-year) precisely, while answering the user query.
-"Closed offenses" are same as "offenses with status closed".
-If the keyword "last" is there like, "last 7 days" or "last week" etc, then exclude today.
-Use ONLY "start_time" to calculate assigned and closed offenses within a specific time period, unless instructed differently.
-Keep this in mind while calculating : **Total offense=closed offenses+open offenses**
-If the required information is not in the DataFrame, respond with: "Sorry, I can only help with queries related to offenses."
-
-Do not repeat content in your answer.
-NEVER create data of your own.
-Do not respond in tabular format. Format your answer as a list.
-Be consistent with your answers.
-Do not return any code.
-Do not create column name.
-Current date is: {date_now()}
-"""
-    
-    # Check if query contains graph keywords
-    x, y = graph_query(query)
-    
-    if x:
-        db_name = "jubilent/offense.db"
-        amcharts_data = gen(query, df_offenses, db_name)
+    while i < len(groups):
+        current_group = groups[i]
         
-        if amcharts_data:
-            response = {
-                "text": "", 
-                "graph_data": amcharts_data, 
-                "type": "pie" if y == "visualize" else "bar"
+        # Check if current group is orphaned
+        # (no PO number detected on any page)
+        is_orphaned = True
+        for page_bytes in current_group['pages']:
+            po_num = None
+            if use_di:
+                di_result = di_cache.get(page_bytes)
+                if di_result:
+                    po_num = extract_po_number_from_di_result(di_result)
+            if not po_num:
+                po_num = extract_po_number_fallback(page_bytes)
+            
+            if po_num:
+                is_orphaned = False
+                break
+        
+        # If orphaned and not the last group, merge with next
+        if is_orphaned and i + 1 < len(groups):
+            logger.info(f"Detected orphaned group {i + 1} (pages {current_group['page_range']})")
+            logger.info(f"  Merging with next group (pages {groups[i + 1]['page_range']})")
+            
+            next_group = groups[i + 1]
+            merged_group = {
+                'start_page': current_group['start_page'],
+                'end_page': next_group['end_page'],
+                'page_range': f"{current_group['start_page']}-{next_group['end_page']}",
+                'pages': current_group['pages'] + next_group['pages']
             }
-            # Further conditional logic for type setting
-            if y == "graph":
-                response["type"] = "bar"
-            elif y == "chart" or y == "draw":
-                response["type"] = "trendline"
-            
-            return response
+            merged_groups.append(merged_group)
+            i += 2  # Skip both current and next
         else:
-            response = "Please elaborate your question"
-            return {"text": response, "type": "text"}
-    else:
-        # For non-graph queries, use Bedrock for general analysis
-        try:
-            # Initialize Bedrock model for general queries
-            chat_model = ChatBedrockConverse(
-                model="amazon.nova-lite-v1:0",
-                region_name="us-east-1",
-            )
-            
-            # Create prompt and chain for general queries
-            prompt = PromptTemplate.from_template(
-                "{system_prompt}\n\nUser Query: {query}"
-            )
-            
-            chain = prompt | chat_model | StrOutputParser()
-            
-            result_content = chain.invoke({
-                "system_prompt": custom_prompt_off.format(date_now=datetime.now),
-                "query": query
-            })
-            
-            if "execution environment" in result_content:
-                return {"text": "An error occurred. Please refresh the page and try again", "graph_data": None, "type": "text"}
-            else:
-                return {"text": result_content, "graph_data": None, "type": "text"}
-                
-        except Exception as e:
-            print(f"Error: {e}")
-            return {"text": "An error occurred. Please refresh the page and try again", "graph_data": None, "type": "text"}
-
-def gen(query, df_offenses, db_name):
-    """Generate graph data using Bedrock"""
-    system_prompt = """Simplify the above question, to create an correct SQL query. 
-Remove extra information which is not needed for an SQL query. Just return the SQL query without any additional text."""
+            merged_groups.append(current_group)
+            i += 1
     
-    try:
-        # Initialize Bedrock model
-        chat_model = ChatBedrockConverse(
-            model="amazon.nova-lite-v1:0",
-            region_name="us-east-1",
-        )
-        
-        # Create prompt for SQL generation
-        sql_prompt = PromptTemplate.from_template(
-            "Simplify the above question, to create a correct SQL query. "
-            "Remove extra information which is not needed for an SQL query. "
-            "Just return the SQL query without any additional text.\n\nQuestion: {content}"
-        )
-        
-        # Create the chain
-        chain = sql_prompt | chat_model | StrOutputParser()
-        
-        response_message = chain.invoke({"content": query})
-        
-        # Process the SQL and generate graph data
-        amcharts_data = graph_json(response_message, df_offenses, db_name)
-        return amcharts_data
-        
-    except Exception as e:
-        print(f"Error in gen function: {e}")
-        return None
+    return merged_groups
+```
 
-# Requirements for your requirements.txt file:
-"""
-langchain-aws>=0.1.0
-langchain-core>=0.1.0
-pandas>=1.5.0
-# Note: sqlite3 is included with Python standard library
-# langchain-aws handles AWS authentication internally, no need for boto3
-"""
+**Integration in main flow:**
+```python
+# In extract_pos_from_pdf(), after Step 3:
+logger.info("\nSTEP 3.5: Merging orphaned pages...")
+groups = merge_orphaned_pages(groups, page_bytes_list, use_di=use_di)
+```
+
+#### Solution B: Configurable Orphan Threshold
+Allow merging of pages below a certain page count threshold:
+
+```python
+def merge_small_groups(groups: List[Dict[str, Any]], 
+                      min_pages: int = 2) -> List[Dict[str, Any]]:
+    """Merge groups with fewer than min_pages pages with the next group."""
+    merged_groups = []
+    i = 0
+    
+    while i < len(groups):
+        current_group = groups[i]
+        
+        if len(current_group['pages']) < min_pages and i + 1 < len(groups):
+            logger.info(f"Group {i + 1} has only {len(current_group['pages'])} page(s)")
+            logger.info(f"  Merging with next group")
+            
+            next_group = groups[i + 1]
+            merged_group = {
+                'start_page': current_group['start_page'],
+                'end_page': next_group['end_page'],
+                'page_range': f"{current_group['start_page']}-{next_group['end_page']}",
+                'pages': current_group['pages'] + next_group['pages']
+            }
+            merged_groups.append(merged_group)
+            i += 2
+        else:
+            merged_groups.append(current_group)
+            i += 1
+    
+    return merged_groups
+```
+
+---
+
+## Edge Case 2: Missing PO Numbers AND Page Numbers
+
+### Current Behavior
+The system **cannot split the document** because:
+- No "Page 1" detection → no boundary based on page numbering
+- No PO number changes → no boundary based on PO identification
+- `detect_document_boundaries()` returns only `[0]` (single document)
+
+**Example Scenario:**
+```
+Input PDF:
+  Page 1: PO without "Page 1" indicator, no PO number
+  Page 2: Another PO without "Page 1" indicator, no PO number
+  Page 3: Another PO without "Page 1" indicator, no PO number
+
+Current Output:
+  Document 1: Pages 1-3 (all merged as one)
+```
+
+### Root Cause
+The boundary detection algorithm depends on:
+1. Page numbers (e.g., "Page 1 of 3")
+2. PO numbers (e.g., "PO-12345")
+
+Without these, the system has **no mechanism to detect document boundaries**.
+
+### Recommended Solutions
+
+#### Solution A: Structural/Layout-Based Detection (Most Robust)
+Detect new documents by analyzing page structure changes:
+
+```python
+def detect_layout_boundaries(page_bytes_list: List[bytes]) -> List[int]:
+    """
+    Detect document boundaries based on layout changes.
+    Heuristics:
+    1. Major whitespace/content positioning changes
+    2. Significant text density changes
+    3. Table presence changes
+    4. Header/footer signature changes
+    """
+    boundaries = [0]
+    
+    previous_layout_hash = None
+    
+    for i, page_bytes in enumerate(page_bytes_list):
+        try:
+            doc = fitz.open(stream=page_bytes, filetype="pdf")
+            page = doc[0]
+            
+            # Extract layout features
+            text_blocks = page.get_text("blocks")
+            images = page.get_images()
+            
+            # Calculate layout signature
+            layout_hash = hashlib.md5(
+                f"{len(text_blocks)}_{len(images)}_{page.get_text('text')[:100]}".encode()
+            ).hexdigest()[:8]
+            
+            # If layout significantly changed, likely new document
+            if previous_layout_hash and layout_hash != previous_layout_hash:
+                # Additional check: verify it's not just a page break
+                content_density = len(page.get_text("text").strip()) / (page.rect.width * page.rect.height)
+                
+                if content_density > 0.05:  # Significant content on new layout
+                    logger.info(f"  Layout change detected at page {i + 1} - possible new document")
+                    boundaries.append(i)
+            
+            previous_layout_hash = layout_hash
+            doc.close()
+            
+        except Exception as e:
+            logger.error(f"Layout analysis error on page {i + 1}: {e}")
+    
+    return boundaries
+```
+
+#### Solution B: Content Similarity Detection
+Detect document boundaries by analyzing content blocks:
+
+```python
+def detect_content_boundaries(page_bytes_list: List[bytes]) -> List[int]:
+    """
+    Detect boundaries by analyzing content block similarity.
+    If two consecutive pages have very different content blocks,
+    likely a new document.
+    """
+    from difflib import SequenceMatcher
+    
+    boundaries = [0]
+    previous_content_signature = None
+    
+    for i, page_bytes in enumerate(page_bytes_list):
+        try:
+            doc = fitz.open(stream=page_bytes, filetype="pdf")
+            page = doc[0]
+            
+            # Get text blocks as signature
+            text = page.get_text("text").strip()
+            text_blocks = [block for block in page.get_text("blocks") if block[4]]
+            
+            # Create signature from first few blocks
+            signature = " ".join([block[4][:50] for block in text_blocks[:5]])
+            
+            if previous_content_signature:
+                # Compare similarity
+                similarity = SequenceMatcher(
+                    None, 
+                    previous_content_signature[:300],
+                    signature[:300]
+                ).ratio()
+                
+                # If very different, might be new document
+                if similarity < 0.3 and i > 0:
+                    logger.info(f"  Content change detected at page {i + 1} (similarity: {similarity:.2f})")
+                    boundaries.append(i)
+            
+            previous_content_signature = signature
+            doc.close()
+            
+        except Exception as e:
+            logger.error(f"Content analysis error on page {i + 1}: {e}")
+    
+    return boundaries
+```
+
+#### Solution C: Table Structure Detection (Recommended for POs)
+Most POs have structured table layouts. Detect boundaries when table structure changes:
+
+```python
+def detect_table_boundary_changes(page_bytes_list: List[bytes]) -> List[int]:
+    """
+    Detect boundaries based on table structure/positions.
+    Most POs have consistent table layouts; a change suggests new document.
+    """
+    boundaries = [0]
+    previous_table_signature = None
+    
+    for i, page_bytes in enumerate(page_bytes_list):
+        try:
+            # Use DI to get table information
+            di_result = analyze_page_with_di(page_bytes)
+            
+            if di_result and di_result.tables:
+                # Create signature from tables
+                table_signature = {
+                    'count': len(di_result.tables),
+                    'dimensions': [(t.row_count, t.column_count) for t in di_result.tables],
+                    'content_preview': di_result.content[:200] if di_result.content else ""
+                }
+                
+                if previous_table_signature:
+                    # If table structure changed significantly
+                    if (table_signature['count'] != previous_table_signature['count'] or
+                        table_signature['dimensions'] != previous_table_signature['dimensions']):
+                        
+                        logger.info(
+                            f"  Table structure change at page {i + 1}: "
+                            f"from {previous_table_signature['count']} to {table_signature['count']} tables"
+                        )
+                        boundaries.append(i)
+                
+                previous_table_signature = table_signature
+            elif previous_table_signature and i > 0:
+                # Table disappeared - possible document boundary
+                logger.info(f"  Tables disappeared at page {i + 1}")
+                boundaries.append(i)
+        
+        except Exception as e:
+            logger.error(f"Table analysis error on page {i + 1}: {e}")
+    
+    return boundaries
+```
+
+#### Solution D: Hybrid Approach (Best for Production)
+Combine multiple detection methods with weighted scoring:
+
+```python
+def detect_boundaries_hybrid(page_bytes_list: List[bytes], 
+                            use_di: bool = True) -> List[int]:
+    """
+    Hybrid boundary detection using multiple methods with confidence scoring.
+    
+    Detection Methods (in priority order):
+    1. Page number = 1 (highest confidence)
+    2. PO number change (high confidence)
+    3. Table structure change (medium confidence)
+    4. Layout changes (medium confidence)
+    5. Content similarity (low confidence)
+    """
+    boundaries = [0]
+    confidence_scores = {0: 1.0}  # Start has 100% confidence
+    
+    # Method 1 & 2: Existing detection (page numbers + PO numbers)
+    existing_boundaries = detect_document_boundaries(page_bytes_list, use_di)
+    for b in existing_boundaries[1:]:  # Skip 0
+        confidence_scores[b] = confidence_scores.get(b, 0) + 0.5  # 50% confidence boost
+    
+    # Method 3: Table structure
+    if use_di:
+        table_boundaries = detect_table_boundary_changes(page_bytes_list)
+        for b in table_boundaries[1:]:
+            confidence_scores[b] = confidence_scores.get(b, 0) + 0.3  # 30% confidence boost
+    
+    # Method 4: Layout changes
+    layout_boundaries = detect_layout_boundaries(page_bytes_list)
+    for b in layout_boundaries[1:]:
+        confidence_scores[b] = confidence_scores.get(b, 0) + 0.2  # 20% confidence boost
+    
+    # Filter: Keep boundaries with confidence > 0.4 (40%)
+    final_boundaries = sorted([
+        b for b, conf in confidence_scores.items() 
+        if conf >= 0.4
+    ])
+    
+    logger.info("\nBoundary Detection Confidence Scores:")
+    for b in final_boundaries[1:]:  # Skip 0
+        logger.info(f"  Page {b + 1}: {confidence_scores[b]:.1%} confidence")
+    
+    return final_boundaries
+```
+
+**Usage:**
+```python
+# In extract_pos_from_pdf(), replace Step 2:
+logger.info("\nSTEP 2: Detecting document boundaries...")
+# Try primary method first
+boundaries = detect_document_boundaries(page_bytes_list, use_di=use_di)
+
+# If only one document detected, try hybrid approach
+if len(boundaries) == 1 and len(page_bytes_list) > 1:
+    logger.info("No boundaries detected with primary method, trying hybrid approach...")
+    boundaries = detect_boundaries_hybrid(page_bytes_list, use_di=use_di)
+```
+
+---
+
+## Summary: Complete Implementation Strategy
+
+### For Edge Case 1 (Cover Pages):
+```python
+# In extract_pos_from_pdf(), after grouping:
+groups = group_pages_by_boundaries(page_bytes_list, boundaries)
+groups = merge_orphaned_pages(groups, page_bytes_list, use_di=use_di)
+```
+
+### For Edge Case 2 (Missing Identifiers):
+```python
+# In extract_pos_from_pdf(), during boundary detection:
+boundaries = detect_document_boundaries(page_bytes_list, use_di=use_di)
+
+if len(boundaries) == 1 and len(page_bytes_list) > 1:
+    logger.warning("No boundaries detected, attempting hybrid detection...")
+    boundaries = detect_boundaries_hybrid(page_bytes_list, use_di=use_di)
+```
+
+### Configuration Options (Recommended):
+```python
+class POExtractionConfig:
+    """Configuration for PO extraction behavior"""
+    merge_orphaned_pages: bool = True
+    orphan_page_threshold: int = 2  # Merge groups with < 2 pages
+    
+    use_hybrid_boundaries: bool = True  # Fall back to hybrid if needed
+    confidence_threshold: float = 0.4  # Only keep boundaries above this
+    
+    boundary_detection_methods: List[str] = [
+        "page_numbers",      # Page 1 detection
+        "po_numbers",        # PO changes
+        "table_structure",   # Table layout changes
+        "layout_changes",    # Overall page layout
+        "content_similarity" # Text content comparison
+    ]
+```
+
+This approach handles both edge cases gracefully while maintaining backward compatibility with well-formed PDFs.
