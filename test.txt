@@ -1,1282 +1,558 @@
 """
-UNL Purchase Order Processing Pipeline
-========================================
-Full end-to-end flow stitched from flowchart screenshots (Images 1-15).
-
-Phases
-------
-0  – PO Extraction Trigger          (PA045 / OnPOExtractionComplete)
-1  – UAE/SA Agent Entry             (UNL Purchase Order Processing Agent)
-2  – AF004 Customer Identification  (CAN ↔ Ship-To comparison, Sales Org path)
-3  – High-Confidence Customer Validation  (GLN / fuzzy-match / Dataverse search)
-4  – Counts-Properties Branching    (Strong / Medium / High / Total == 0)
-5  – Ship-To / Sold-To Retrieval    (CMD secondary lookup)
-6  – Final Null-Check Validations   (validshiptocode, validsalesorgnum)
-7  – Post-AF004 Continuation        (Delivery Date → GLN → Duplicate → POL)
-8  – AF006 Delivery-Date Validation
-9  – GLN + Common + Duplicate       (AF007, TP007, AF003)
-10 – AF012 POL Validations          (Azure func POL_UAE)
-11 – AF003 Duplicate Detection      (region-aware)
-
-All external reads/writes are stubbed and marked with
-    # ── SQL / Azure ──
-comments so you can wire them to your Azure SQL tables or Azure Functions.
+Purchase Order Validation Flow
+Complete integration of all validation steps from the flowcharts
 """
 
-from __future__ import annotations
-
-from datetime import date, timedelta
-from typing import Any
-
-
-# ---------------------------------------------------------------------------
-# 0.  TYPE ALIASES  (lightweight; replace with Pydantic / dataclasses as needed)
-# ---------------------------------------------------------------------------
-PORecord = dict[str, Any]          # row from the PO table
-CMDRecord = dict[str, Any]         # Customer-Master-Data row
-SalesOrgRecord = dict[str, Any]    # Sales-Org-Master row
-MatchRecord = dict[str, Any]       # High-confidence-customer-match row
-
-
-# ===========================================================================
-# EXTERNAL-CALL STUBS  –  replace bodies with real Azure SQL / Function calls
-# ===========================================================================
-
-# ── SQL / Azure ──
-def sql_get_po(po_guid: str) -> PORecord:
-    """SELECT * FROM PurchaseOrders WHERE Guid = @po_guid"""
-    raise NotImplementedError("Wire to Azure SQL – PurchaseOrders table")
-
-
-# ── SQL / Azure ──
-def sql_update_po(po_guid: str, **fields) -> None:
-    """UPDATE PurchaseOrders SET … WHERE Guid = @po_guid"""
-    raise NotImplementedError("Wire to Azure SQL – PurchaseOrders table")
-
-
-# ── SQL / Azure ──
-def sql_get_cmd_by_shipto(ship_to_code: str, state_code: int = 0) -> list[CMDRecord]:
-    """
-    SELECT * FROM CustomerMasterData
-    WHERE ShipToCode = @ship_to_code AND StateCode = @state_code
-    """
-    raise NotImplementedError("Wire to Azure SQL – CustomerMasterData table")
-
-
-# ── SQL / Azure ──
-def sql_get_sales_org_master(sales_org_name: str) -> list[SalesOrgRecord]:
-    """SELECT * FROM SalesOrgMaster WHERE Name = @sales_org_name"""
-    raise NotImplementedError("Wire to Azure SQL – SalesOrgMaster table")
-
-
-# ── SQL / Azure ──
-def sql_get_cmd_by_soldto(sold_to_code: str) -> list[CMDRecord]:
-    """SELECT * FROM CustomerMasterData WHERE SoldToCode = @sold_to_code"""
-    raise NotImplementedError("Wire to Azure SQL – CustomerMasterData table")
-
-
-# ── SQL / Azure ──
-def sql_get_cmd_by_shipto_code(ship_to_code: str) -> list[CMDRecord]:
-    """SELECT * FROM CustomerMasterData WHERE ShipToCode = @ship_to_code"""
-    raise NotImplementedError("Wire to Azure SQL – CustomerMasterData table")
-
-
-# ── SQL / Azure ──
-def sql_create_hccm(name: int, customer: str, teams: str,
-                    po_guid: str, threshold: int,
-                    threshold_type: str = "Exact") -> None:
-    """INSERT INTO HighConfidenceCustomerMatches …"""
-    raise NotImplementedError("Wire to Azure SQL – HighConfidenceCustomerMatches table")
-
-
-# ── SQL / Azure ──
-def sql_create_mccm(name: int, customer: str, teams: str,
-                    po_guid: str, threshold: str) -> None:
-    """INSERT INTO ModerateConfidenceCustomerMatches …"""
-    raise NotImplementedError("Wire to Azure SQL – ModerateConfidenceCustomerMatches table")
-
-
-# ── SQL / Azure ──
-def sql_list_duplicate_po(extracted_po_number: str, region: str) -> list[PORecord]:
-    """
-    SELECT * FROM PurchaseOrders
-    WHERE ExtractedPONumber = @extracted_po_number
-      AND Region = @region
-    """
-    raise NotImplementedError("Wire to Azure SQL – PurchaseOrders table (duplicate scan)")
-
-
-# ── SQL / Azure ──
-def azure_func_hitl_log(message: str) -> None:
-    """POST to Azure Function 'HITLLog' – writes an operational log entry."""
-    raise NotImplementedError("Wire to Azure Function – HITLLog")
-
-
-# ── SQL / Azure ──
-def azure_func_find_customer_dataverse(po_guid: str,
-                                       customer_name: str | None,
-                                       supplier_name: str | None) -> dict[str, Any]:
-    """
-    POST to Azure Function 'FindCustomerDataUsingDataversSearch'
-    Body: { poGuid, customerName, supplierName }
-    Returns parsed JSON response with counts & match details.
-    """
-    raise NotImplementedError("Wire to Azure Function – FindCustomerDataUsingDataversSearch")
-
-
-# ── SQL / Azure ──
-def azure_func_pol_uae(po_guid: str) -> dict[str, Any]:
-    """
-    POST to Azure Function 'POL_UAE'
-    Body: { "poGuid": po_guid }
-    Returns { success: bool, … }
-    """
-    raise NotImplementedError("Wire to Azure Function – POL_UAE")
-
-
-# ── SQL / Azure ──
-def sql_get_next_autonumber(prefix: str) -> str:
-    """
-    Generate next sequence number for extracted PO naming.
-    Format: <prefix>-MM-DD-YYYY-<Sequence>   (e.g. NOVA-02-03-2026-0001)
-    Typically backed by a DB sequence or a dedicated autonumber table.
-    """
-    raise NotImplementedError("Wire to Azure SQL – AutonumberSequences table or equivalent")
-
-
-# ===========================================================================
-# PHASE 0  –  PO EXTRACTION TRIGGER
-#             (PA045 | PurchaseOrder | OnPOExtractionCompleteCallRegionSpecificAgent)
-# ===========================================================================
-
-def phase_0_po_extraction_trigger(po_guid: str) -> str:
-    """
-    Entry point fired when PO Status Code transitions to "PO Extraction Complete".
-
-    Returns the region tag ("UAE" | "SA") that was routed to.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-
-    extracted_po_number: str | None = po.get("extrponumber")
-
-    # --- Is Extrponumber Null? ---
-    if extracted_po_number is None:
-        # Generate autonumber: NOVA-MM-DD-YYYY-Sequence
-        # ── SQL / Azure ──
-        auto_name = sql_get_next_autonumber("NOVA")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, extracted_po_number=auto_name)
-
-    # --- Is Country UAE? ---
-    country: str = po.get("country", "").upper()
-    if country == "UAE":
-        phase_1_uae_agent_entry(po_guid)
-        return "UAE"
-    else:
-        # SA agent path – mirror structure; not fully expanded here as
-        # the provided screenshots focus on the UAE agent internals.
-        # ── SQL / Azure ──  (call SA agent analogous to UAE agent below)
-        azure_func_hitl_log(f"[Phase 0] Routed PO {po_guid} to SA Agent")
-        return "SA"
-
-
-# ===========================================================================
-# PHASE 1  –  UAE AGENT ENTRY
-#             (UNL Purchase Order Processing UAE Agent)
-# ===========================================================================
-
-def phase_1_uae_agent_entry(po_guid: str, message: str = "") -> None:
-    """
-    Agent is triggered with PO GUID as parameter.
-    Branches on whether the incoming Copilot message flags a reprocess.
-    """
-    is_reprocessing: bool = "reprocess" in message.lower()
-
-    if not is_reprocessing:
-        # --- TP004 | Customer Identification through AgentFlow ---
-        # Call Flow AF004 with PO as input
-        phase_2_af004_customer_identification(po_guid)
-    else:
-        # --- TP008 | Reprocess Duplicate PO ---
-        # ── SQL / Azure ──
-        azure_func_hitl_log(f"[Phase 1] Reprocess path triggered for PO {po_guid}")
-        # Jump directly to POL validations
-        phase_10_af012_pol_validations(po_guid)
-
-
-# ===========================================================================
-# PHASE 2  –  AF004  CUSTOMER IDENTIFICATION
-#             Triggered by agent with PO GUID as input
-# ===========================================================================
-
-def phase_2_af004_customer_identification(po_guid: str) -> None:
-    """
-    1. Reads PO to get extracted customer-account-number (CAN) and sales org.
-    2. Compares CAN against CustomerMasterData ShipToCode.
-    3. Depending on match count, either creates a high-confidence match directly
-       or falls through to the Sales-Org lookup path.
-    4. After customer resolution, runs Ship-To/Sold-To retrieval and final
-       null-check validations (Phases 5-6) before responding back to Copilot.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-
-    extracted_customer_account_num: str | None = po.get("extrcustaccnum")
-    sales_org: str | None = po.get("salesorganisation")
-    order_file_type: str = po.get("orderfiletype", "PDF")
-    extracted_customer_name: str | None = po.get("extrcustname")
-    extracted_delivery_address: str | None = po.get("extrdeliveryaddr")
-    valid_customer_name: str | None = po.get("validcustname")  # set during reprocess
-    owner: str = po.get("owner", "")
-
-    # ── ── ──  validate_po_customer_and_can  (provided validation) ── ── ──
-    # Initial status stamp
-    # ── SQL / Azure ──
-    sql_update_po(po_guid,
-                  status_reason="PO Validation InProgress",
-                  po_setup=True)
-
-    if valid_customer_name:
-        # Reprocess scenario – re-stamp in-progress
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation InProgress")
-
-    # Hard-fail guard for PDF with no extractable fields
-    if (valid_customer_name is None
-            and order_file_type.upper() == "PDF"
-            and extracted_customer_name is None
-            and extracted_delivery_address is None):
-        # ── SQL / Azure ──
-        azure_func_hitl_log("Customer name and delivery address missing for PDF order")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return
-
-    # ── ── ──  Compare CAN with Ship-To Code  ── ── ──
-    # ── SQL / Azure ──
-    cmd_records: list[CMDRecord] = sql_get_cmd_by_shipto(
-        ship_to_code=extracted_customer_account_num or "",
-        state_code=0
-    )
-
-    # Delegate to process_can_shipto_match (provided validation, wired below)
-    resolved_customer = _phase_2_process_can_shipto(
-        po_guid=po_guid,
-        cmd_records=cmd_records,
-        sales_org=sales_org,
-        extracted_account_num=extracted_customer_account_num or "",
-        owner=owner
-    )
-
-    # ── ── ──  Phases 5-6: Ship-To/Sold-To retrieval + null checks  ── ── ──
-    phase_5_shipto_soldto_retrieval(po_guid)
-    phase_6_final_null_checks(po_guid)
-
-    # Respond to Copilot – flow continues in Phase 7
-    # ── SQL / Azure ──
-    azure_func_hitl_log(f"[AF004] Completed for PO {po_guid}. Responding to Copilot.")
-
-
-def _phase_2_process_can_shipto(po_guid: str,
-                                cmd_records: list[CMDRecord],
-                                sales_org: str | None,
-                                extracted_account_num: str,
-                                owner: str) -> str | None:
-    """
-    Implements process_can_shipto_match logic from the provided validation,
-    mapped onto the flowchart branches (Images 4-5).
-    """
-
-    # ─── Case 1: Exactly one CMD Ship-To match ───
-    if len(cmd_records) == 1:
-        customer_id: str = cmd_records[0]["accountId"]
-        # ── SQL / Azure ──
-        sql_update_po(po_guid,
-                      po_setup=True,
-                      status_reason="PO Validation InProgress",
-                      validated_customer=customer_id)
-        # ── SQL / Azure ──
-        sql_create_hccm(name=1,
-                        customer=customer_id,
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold=1)
-        # ── SQL / Azure ──
-        azure_func_hitl_log("High confidence customer created using Ship-To match")
-        return customer_id
-
-    # ─── Case 2: No Ship-To match  →  Sales Org path ───
-    if not sales_org:
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Validated Customer Account Number - Validation Error: "
-            "No record found for customer master data"
-        )
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return None
-
-    # Is SalesOrganisation eq not null  →  Get Sales Org Master Data
-    # ── SQL / Azure ──
-    sales_org_records: list[SalesOrgRecord] = sql_get_sales_org_master(sales_org)
-
-    # ── Only one record found in Sales Org Master Data? ──
-    if len(sales_org_records) == 1:
-        customer_id = sales_org_records[0].get("accountId", "")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, validated_customer=customer_id)
-        # ── SQL / Azure ──
-        sql_create_hccm(name=1,
-                        customer=customer_id,
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold=1)
-        # ── SQL / Azure ──
-        azure_func_hitl_log("PO Validation Complete - Customer Found Based on Account Number")
-        return customer_id
-
-    # ── Record found eq 0 and filetype not eq pdf  →  error ──
-    if len(sales_org_records) == 0:
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Validated Customer Account Number - Validation Error: "
-            "No record found for customer master data"
-        )
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return None
-
-    # ── More than one Sales Org record  →  child flow PAChild 027 ──
-    # Create initial HCCM with first filtered match before calling child
-    # ── SQL / Azure ──
-    sql_create_hccm(name=1,
-                    customer=sales_org_records[0].get("accountId", ""),
-                    teams=owner,
-                    po_guid=po_guid,
-                    threshold=1)
-
-    # Run PAChild 027  →  High Confidence Customer Validation Check
-    # ── SQL / Azure ──  (reads PO for country_code, customer_found, extrsuppname)
-    po: PORecord = sql_get_po(po_guid)
-    phase_3_high_confidence_customer_validation(po_guid, po)
-    return None  # customer resolved inside phase 3
-
-
-# ===========================================================================
-# PHASE 3  –  HIGH-CONFIDENCE CUSTOMER VALIDATION  (PAChild 027)
-#             Implements high_confidence_customer_validation (provided)
-# ===========================================================================
-
-def phase_3_high_confidence_customer_validation(po_guid: str, po: PORecord) -> None:
-    """
-    Runs the provided high_confidence_customer_validation logic.
-    If the customer is NOT already found via GLN, calls the Dataverse search
-    Azure Function and hands off to Phase 4 (Counts Properties).
-    """
-    country_code: str | None = po.get("countrycode")
-    sa_country_code: str | None = po.get("sa_countrycode")
-    customer_found: bool = bool(po.get("customer_found"))
-    extrsuppname: str | None = po.get("extrsuppname")
-
-    # ── "matches" are the existing HighConfidenceCustomerMatches rows for this PO ──
-    # ── SQL / Azure ──
-    # matches = sql_get_hccm_for_po(po_guid)   # if needed for the full validation
-
-    # --- provided logic stub (high_confidence_customer_validation) ---
-    # Condition: (country_code or sa_country_code) and not customer_found
-    if not ((country_code or sa_country_code) and not customer_found):
-        # Customer already found (e.g. via GLN)  →  update PO & log
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, customer_found=True)
-        # ── SQL / Azure ──
-        azure_func_hitl_log("Customer Found Based on GLN Code Logic")
-        return
-
-    # Customer NOT found  →  call Dataverse search
-    # ── SQL / Azure ──
-    dataverse_response: dict[str, Any] = azure_func_find_customer_dataverse(
-        po_guid=po_guid,
-        customer_name=po.get("extrcustname"),
-        supplier_name=extrsuppname
-    )
-
-    # Hand off to Phase 4 – Counts Properties branching
-    phase_4_counts_properties(po_guid, dataverse_response, po.get("owner", ""))
-
-
-# ===========================================================================
-# PHASE 4  –  COUNTS PROPERTIES / FUZZY-MATCH BRANCHING  (Image 7)
-# ===========================================================================
-
-def phase_4_counts_properties(po_guid: str,
-                              dataverse_response: dict[str, Any],
-                              owner: str) -> None:
-    """
-    Evaluates StrongCount, MediumCount, HighCount, Total from the
-    Dataverse search response and routes accordingly.
-
-    All create_hccm / create_mccm / update_po / log calls map directly
-    to the boxes in Image 7.
-    """
-    strong_count: int = dataverse_response.get("strongCount", 0)
-    medium_count: int = dataverse_response.get("mediumCount", 0)
-    high_count: int = dataverse_response.get("highCount", 0)
-    total: int = dataverse_response.get("total", 0)
-
-    body: list[dict] = dataverse_response.get("body", [])
-    # Convenience – first strong / high / medium match bodies
-    first_strong = next((r for r in body if r.get("threshold") == "Strong"), {})
-    first_high   = next((r for r in body if r.get("threshold") == "High"),   {})
-
-    # ─────────────────────────────────────────────
-    # Total == 0  →  no matches at all
-    # ─────────────────────────────────────────────
-    if total == 0:
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Customer Not Found. There are no records meeting "
-            "high or medium threshold criteria"
-        )
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Validated Customer Name - Validation Error. "
-            "Check the correct value in the master data"
-        )
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return
-
-    # ─────────────────────────────────────────────
-    # StrongCount == 1  →  direct high-confidence match
-    # ─────────────────────────────────────────────
-    if strong_count == 1:
-        validated_customer = first_strong.get("objectId", "")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid,
-                      validated_customer=validated_customer,
-                      po_setup=True,
-                      status_reason="PO Validation InProgress")
-        # ── SQL / Azure ──
-        sql_create_hccm(name=1,
-                        customer=first_strong.get("validcutname", validated_customer),
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold=1)
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "PO Validation Complete - Customer found based on fuzzy match "
-            "of Name and Delivery Address. Successfully updated."
-        )
-        # Second log (same message – mirrors flowchart)
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "PO Validation Complete - Customer found based on fuzzy match "
-            "of Name and Delivery Address. Successfully updated."
-        )
-        # ── SQL / Azure ──
-        sql_create_hccm(name=1,
-                        customer=first_strong.get("bodyObjectId", ""),
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold=1,
-                        threshold_type="Body Similarity")
-        return
-
-    # ─────────────────────────────────────────────
-    # StrongCount > 1  →  moderate-confidence match
-    # ─────────────────────────────────────────────
-    if strong_count > 1:
-        # ── SQL / Azure ──
-        sql_create_mccm(name=1,
-                        customer=first_strong.get("bodyObjectId", ""),
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold="Body Similarity")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid,
-                      validated_customer=first_strong.get("objectId", ""),
-                      po_setup=True,
-                      status_reason="PO Validation InProgress")
-        return
-
-    # ─────────────────────────────────────────────
-    # MediumCount > 0  (and Strong == 0)
-    # ─────────────────────────────────────────────
-    if medium_count > 0:
-        first_medium = next((r for r in body if r.get("threshold") == "Medium"), {})
-        # ── SQL / Azure ──
-        sql_create_mccm(name=1,
-                        customer=first_medium.get("bodyObjectId", ""),
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold="Body Similarity")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid,
-                      validated_customer=first_medium.get("objectId", ""),
-                      po_setup=True,
-                      status_reason="PO Validation InProgress")
-        return
-
-    # ─────────────────────────────────────────────
-    # StrongCount == 0  →  check HighCount
-    # ─────────────────────────────────────────────
-    if high_count > 1:
-        # Multiple high-threshold matches
-        # ── SQL / Azure ──
-        sql_create_hccm(name=1,
-                        customer=first_high.get("bodyObjectId", ""),
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold=1,
-                        threshold_type="Body Similarity")
-
-        # "If all are high threshold with same similarity" – ambiguity gate
-        # In practice this loops or escalates; log for manual review.
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Multiple high-threshold matches with equal similarity detected. "
-            "Manual review required."
-        )
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return
-
-    if high_count == 1:
-        validated_customer = first_high.get("objectId", "")
-        # ── SQL / Azure ──
-        sql_update_po(po_guid,
-                      validated_customer=validated_customer,
-                      po_setup=True,
-                      status_reason="PO Validation InProgress")
-        # ── SQL / Azure ──
-        sql_create_hccm(name=1,
-                        customer=first_high.get("bodyObjectId", ""),
-                        teams=owner,
-                        po_guid=po_guid,
-                        threshold=1,
-                        threshold_type="Body Similarity")
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "PO Validation Complete - Customer found based on fuzzy match "
-            "of Name and Delivery Address. Successfully updated."
-        )
-        return
-
-    # Fall-through: nothing matched at any tier
-    # ── SQL / Azure ──
-    azure_func_hitl_log("Customer Not Found – no tier matched after counts evaluation.")
-    # ── SQL / Azure ──
-    sql_update_po(po_guid, status_reason="PO Validation Error")
-
-
-# ===========================================================================
-# PHASE 5  –  SHIP-TO / SOLD-TO RETRIEVAL  (Images 8-9)
-# ===========================================================================
-
-def phase_5_shipto_soldto_retrieval(po_guid: str) -> None:
-    """
-    After customer resolution, retrieves Ship-To and Sold-To codes
-    from CustomerMasterData using the validated customer.
-
-    Also handles the SA-region Sales-Org-Number override path.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-    validated_customer: str = po.get("validated_customer", "")
-    customer_found: bool = bool(po.get("customer_found"))
-    region: str = po.get("region", "").upper()
-    order_file_type: str = po.get("orderfiletype", "").upper()
-    salesorg_from_po: str | None = po.get("salesorganisation")
-    validsalesorgnum: str | None = po.get("validsalesorgnum")
-
-    # ─── Is Customer Found eq false?  →  secondary CMD lookup ───
-    if not customer_found:
-        # ── SQL / Azure ──
-        cmd_rows: list[CMDRecord] = sql_get_cmd_by_shipto(validated_customer)
-
-        if cmd_rows:
-            record = cmd_rows[0]
-            ship_to: str | None = record.get("shipToCode")
-            sold_to: str | None = record.get("soldToCode")
-
-            # Both null  →  try sold-to or ship-to sub-lookups
-            if ship_to is None and sold_to is None:
-                # ── SQL / Azure ──  (retrieve using parent/alt key – see flowchart)
-                cmd_rows = sql_get_cmd_by_shipto(validated_customer)
-            elif ship_to is None and sold_to is not None:
-                # ship-to null, sold-to present  →  look up via sold-to
-                # ── SQL / Azure ──
-                cmd_rows = sql_get_cmd_by_soldto(sold_to)
-            else:
-                # ship-to present  →  look up via ship-to
-                # ── SQL / Azure ──
-                cmd_rows = sql_get_cmd_by_shipto_code(ship_to)
-
-            if cmd_rows:
-                resolved = cmd_rows[0]
-                # ── SQL / Azure ──
-                sql_update_po(po_guid,
-                              validshiptocode=resolved.get("shipToCode"),
-                              validsoldtocode=resolved.get("soldToCode"))
-
-    # ─── Sales Org Number resolution (SA + Excel path) ───
-    if region == "SA" and order_file_type == "EXCEL":
-        if salesorg_from_po and validsalesorgnum is None:
-            # Use the raw PO value
-            # ── SQL / Azure ──
-            sql_update_po(po_guid, validsalesorgnum=salesorg_from_po)
+# =============================================================================
+# VARIABLE DECLARATIONS - TO BE FETCHED FROM AZURE SQL
+# =============================================================================
+
+# Initial PO Data (from trigger)
+po_guid = None  # PO GUID from extraction complete event
+po_status_code = None  # Current PO status code
+extpronumber = None  # Extracted PO number from PA045
+country_code = None  # Country code from PO
+po_extracted_number = None  # Extracted PO number
+
+# Customer Master Data fields
+# SQL: SELECT * FROM CustomerMasterData WHERE <matching_criteria>
+cmd_accountid = None  # Customer account ID from CMD
+cmd_shiptocode = None  # Ship-to code from CMD
+cmd_statecode = None  # State code from CMD
+cmd_exttrustaccnum = None  # External trust account number from CMD
+
+# PO Data fields
+po_salesorganisation = None  # Sales organization from PO
+po_shiptocode = None  # Ship-to code from PO
+po_soldtocode = None  # Sold-to code from PO
+po_validshiptocode = None  # Valid ship-to code from PO
+po_validsalesorgnum = None  # Valid sales org number from PO
+po_customer_name = None  # Customer name from PO
+po_alias = None  # Customer alias from PO
+
+# Sales Organization Master Data
+# SQL: SELECT * FROM SalesOrgMasterData WHERE SalesOrganisation = po_salesorganisation
+sales_org_name = None  # Name from Sales Org Master Data
+
+# Azure Function responses (will be populated during flow)
+azure_func_customer_search_response = None  # Response from FindCustomerDataUsingDataverseSearch
+azure_func_pol_response = None  # Response from POL_UAE function
+azure_func_gln_response = None  # Response from GLN Code Retrieval
+
+# Validation flags
+is_duplicate = False  # Flag for duplicate PO detection
+validation_success = True  # Overall validation success flag
+
+# Lists for high confidence customer matches
+high_confidence_matches = []  # List to store high confidence customer matches
+
+# =============================================================================
+# MAIN FLOW EXECUTION
+# =============================================================================
+
+print("=== Starting PO Validation Flow ===")
+print(f"PO GUID: {po_guid}")
+
+# -----------------------------------------------------------------------------
+# STEP 1: Check if Extpronumber is Null
+# -----------------------------------------------------------------------------
+print("\n--- Step 1: Checking Extpronumber ---")
+
+if extpronumber is None or extpronumber == "":
+    print("Extpronumber is NULL")
+    
+    # Update PO row with Extracted - Purchase Order eq Name
+    # Autonumber format: NOVA-MM-DD-YYYY-Sequence
+    print("ACTION: Update PO with auto-generated name (Autonumber:NOVA-MM-DD-YYYY-Sequence)")
+    # SQL: UPDATE PurchaseOrder SET ExtractedPOName = <autonumber> WHERE PO_GUID = po_guid
+    
+else:
+    print(f"Extpronumber found: {extpronumber}")
+
+# -----------------------------------------------------------------------------
+# STEP 2: Check Country and Route to Appropriate Agent
+# -----------------------------------------------------------------------------
+print("\n--- Step 2: Country-based Agent Routing ---")
+
+if country_code == "UAE":
+    print("Country is UAE - Calling UAE Agent (UNL Purchase Order Processing UAE Agent)")
+    agent_type = "UAE"
+    
+    # Trigger: Agent with PO number as input (UNL Purchase Order Processing UAE Agent)
+    print(f"ACTION: Trigger UAE Agent with PO GUID: {po_guid}")
+    
+else:
+    print("Country is NOT UAE - Calling SA Agent (UNL Purchase Order Processing SA Agent)")
+    agent_type = "SA"
+    
+    # Trigger: Agent with PO number as input (UNL Purchase Order Processing SA Agent)
+    print(f"ACTION: Trigger SA Agent with PO GUID: {po_guid}")
+
+# -----------------------------------------------------------------------------
+# STEP 3: Check for Reprocessing Message
+# -----------------------------------------------------------------------------
+print("\n--- Step 3: Reprocessing Check ---")
+
+# SQL: Check if message contains 'reprocessing' flag
+message_contains_reprocessing = False  # This should be fetched from agent message
+
+if message_contains_reprocessing:
+    print("Message contains reprocessing flag")
+    print("ACTION: Call TPD008 | Reprocess Duplicate PO")
+    # SQL: Execute reprocessing logic
+    print("ACTION: Call AF012 | UAE Agent | Initiate POL Validations")
+    
+else:
+    print("No reprocessing flag - continuing with normal flow")
+    print("ACTION: UAE | TPD04 | Customer Identification through AgentFlow")
+    print("ACTION: Call Flow AF004 (PO as input parameter)")
+
+# -----------------------------------------------------------------------------
+# STEP 4: AF004 Flow - Customer Identification
+# -----------------------------------------------------------------------------
+print("\n--- Step 4: AF004 - Customer Identification ---")
+
+# Compare CAN with Ship To Code
+# SQL: Get Customer Master Data where ShipToCode = po_shiptocode AND StateCode = cmd_statecode
+print("ACTION: Compare CAN with Ship To Code from Customer Master Data")
+
+# Check if one record found with Ship To match
+ship_to_match_count = 0  # SQL: COUNT(*) from CMD where conditions match
+
+if ship_to_match_count == 1:
+    print("One record found with Ship To Code match")
+    
+    # Update PO record
+    print("ACTION: Update PO with Status: Yes, Status Reason: PO Validation Inprogress, Validated - Customer: accountid from CMD")
+    # SQL: UPDATE PurchaseOrder SET 
+    #      POSetup = 'Yes', 
+    #      StatusReason = 'PO Validation Inprogress',
+    #      ValidatedCustomer = cmd_accountid
+    #      WHERE PO_GUID = po_guid
+    
+    # Create High Confidence Customer Match record
+    print("ACTION: Create Record in High Confidence Customer Matches")
+    print("Fields: Name=1, Customer=accid CMD, Teams=Owner from above, PO=PO guid trigger value, Threshold=1")
+    # SQL: INSERT INTO HighConfidenceCustomerMatches 
+    #      (Name, Customer, Teams, PO, Threshold) 
+    #      VALUES (1, cmd_accountid, owner, po_guid, 1)
+
+else:
+    print("Ship To Code match not found or multiple records")
+    
+    # Check if SalesOrganisation is not null
+    if po_salesorganisation is not None and po_salesorganisation != "":
+        print(f"SalesOrganisation is not null: {po_salesorganisation}")
+        
+        # Get Sales Org Master Data
+        print("ACTION: Get Sales Org Master Data (Name eq PO record's SalesOrganisation)")
+        # SQL: SELECT Name FROM SalesOrgMasterData WHERE SalesOrganisation = po_salesorganisation
+        
+        # Check various conditions for Sales Org Master Data
+        sales_org_record_count = 0  # SQL: COUNT of records from above query
+        
+        if sales_org_record_count == 0:
+            print("No record found in Sales Org Master Data")
+            print("ACTION: Call Azure func. HITLLog - 'Validated Customer Account Number - Validation Error. No record found for customer master data'")
+            print("ACTION: Update PO with Status Reason: PO Validation Error")
+            # SQL: UPDATE PurchaseOrder SET StatusReason = 'PO Validation Error' WHERE PO_GUID = po_guid
+            
+        elif sales_org_record_count > 1:
+            print("More than 1 record found in Sales Org Master Data")
+            print("ACTION: Create Record in High Confidence Customer Matches")
+            # SQL: INSERT INTO HighConfidenceCustomerMatches (Name, Customer, Teams, PO, Threshold)
+            #      VALUES (1, cmd_accountid, owner, po_guid, 1)
+            
         else:
-            # Use the already-retrieved value (already set)
-            pass
+            print("Exactly 1 record found - checking filetype")
+            
+            # Check record filetype
+            record_filetype = None  # SQL: SELECT filetype FROM query result
+            
+            if record_filetype is not None and record_filetype != "pdf":
+                print("Record found with filetype NOT equal to pdf")
+                print("ACTION: Call Azure func. HITLLog - 'Validated Customer Account Number - Validation Error. No record found for customer master data'")
+                print("ACTION: Update PO with Status Reason: PO Validation Error")
+                
+            else:
+                print("Record found with valid filetype or pdf")
+                # Continue to customer search flow
+
+# -----------------------------------------------------------------------------
+# STEP 5: Customer Search using Dataverse
+# -----------------------------------------------------------------------------
+print("\n--- Step 5: Customer Data Search ---")
+
+# Check if customer found is false AND valid customer value is null
+customer_found = False  # This will be set based on previous steps
+valid_customer_value = None  # This will be set based on previous steps
+
+if not customer_found and valid_customer_value is None:
+    print("Customer not found - initiating Dataverse search")
+    print("ACTION: Call Azure func. FindCustomerDataUsingDataverseSearch")
+    
+    # Azure Function Call placeholder
+    # azure_func_customer_search_response = call_azure_function("FindCustomerDataUsingDataverseSearch", params)
+    
+    # Parse response counts
+    strong_count = 0  # From azure_func_customer_search_response['StrongCount']
+    medium_count = 0  # From azure_func_customer_search_response['MediumCount']
+    high_count = 0  # From azure_func_customer_search_response['HighCount']
+    total_count = 0  # From azure_func_customer_search_response['Total']
+    
+    print(f"Search Results - Strong: {strong_count}, Medium: {medium_count}, High: {high_count}, Total: {total_count}")
+    
+    # Route based on counts
+    if strong_count == 1:
+        print("StrongCount is 1")
+        print("ACTION: Update PO with Validated - Customer: first response of Azure func objectid")
+        print("ACTION: PO Setup: Yes, Status Reason: PO Validation Inprogress")
+        # SQL: UPDATE PurchaseOrder SET 
+        #      ValidatedCustomer = azure_func_customer_search_response['objects'][0]['id'],
+        #      POSetup = 'Yes',
+        #      StatusReason = 'PO Validation Inprogress'
+        #      WHERE PO_GUID = po_guid
+        
+        print("ACTION: Create Record in High Confidence Customer Matches")
+        # SQL: INSERT INTO HighConfidenceCustomerMatches
+        
+    elif strong_count > 1:
+        print("StrongCount is more than 1")
+        print("ACTION: Update PO with Validated - Customer: first response of Azure func objectid")
+        print("ACTION: PO Setup: Yes, Status Reason: PO Validation Inprogress")
+        
+    elif medium_count > 0:
+        print("MediumCount is greater than 0")
+        print("ACTION: Create Record in Moderate Confidence Customer Matches")
+        # SQL: INSERT INTO ModerateConfidenceCustomerMatches
+        #      (Name, ResponseBody[name], Customer, bodyObjectId, Teams, Owner, PO, Threshold, Body, Similarity)
+        
+    elif high_count > 1:
+        print("HighCount is greater than 1")
+        print("ACTION: Create Record in High Confidence Customer Matches")
+        
+    elif high_count == 1:
+        print("HighCount is 1")
+        print("ACTION: Update PO with Validated - Customer: first response of Azure func objectid")
+        print("ACTION: PO Setup: Yes, Status Reason: PO Validation Inprogress")
+        
+    elif strong_count == 0:
+        print("StrongCount is 0")
+        print("ACTION: Update PO with Validated - Customer: first response of Azure func HighThreshold objectid")
+        print("ACTION: PO Setup: Yes, Status Reason: PO Validation Inprogress")
+        
+    elif total_count == 0:
+        print("Total is 0 - No customers found")
+        print("ACTION: Call Azure func. HITLLog - 'Customer Not Found. There are no records meeting high or medium threshold criteria'")
+        print("ACTION: Call Azure func. HITLLog - 'Validated Customer Name - Validation Error. Check the correct value in the master data'")
+        print("ACTION: Update PO with Status Reason: PO Validation Error")
+        
     else:
-        # Non-SA or non-Excel: Sales Org Number already set from master
-        # ── SQL / Azure ──  (no-op if already populated)
-        pass
+        print("All other conditions - check for high confidence threshold with same similarity")
+        
+        # Check if all high threshold records have same similarity
+        all_same_similarity = False  # Logic to check if Body Similarity is same for all high threshold
+        
+        if all_same_similarity:
+            print("All high threshold records have same Body Similarity")
+            print("ACTION: Create Record in High Confidence Customer Matches")
+            
+        else:
+            print("Different similarity values")
+            print("ACTION: Call Azure func. HITLLog - 'PO Validation Complete - Customer found based on fuzzy match of Name and Delivery Address. Successfully updated'")
 
-    # ─── Get Customer From PO after Validation ───
-    # This is a final read that downstream phases consume; already available via sql_get_po.
+else:
+    print("Customer already found or valid customer value exists - skipping search")
 
+# -----------------------------------------------------------------------------
+# STEP 6: Check Customer Found Status
+# -----------------------------------------------------------------------------
+print("\n--- Step 6: Customer Found Validation ---")
 
-# ===========================================================================
-# PHASE 6  –  FINAL NULL-CHECK VALIDATIONS  (Image 10)
-# ===========================================================================
+customer_found_status = True  # This should be determined from previous steps
 
-def phase_6_final_null_checks(po_guid: str) -> None:
-    """
-    Checks validshiptocode and validsalesorgnum.
-    Either or both being null triggers a Validation Error on the PO.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-
-    # ─── Is validshiptocode eq null? ───
-    if po.get("validshiptocode") is None:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Validated Ship To Code - Validation Error. "
-            "Check the correct value in the master data"
-        )
-        return          # short-circuit – PO is already in error state
-
-    # ─── Is validsalesorgnum eq null? ───
-    if po.get("validsalesorgnum") is None:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Validated Sales Org - Validation Error. "
-            "Check the correct value in the master data"
-        )
-        return
-
-    # Both present – AF004 is done; Copilot continues to Phase 7.
-
-
-# ===========================================================================
-# PHASE 7  –  POST-AF004 CONTINUATION  (Image 11)
-#             Called by Copilot after AF004 responds
-# ===========================================================================
-
-def phase_7_post_af004_continuation(po_guid: str) -> None:
-    """
-    Copilot re-enters here after AF004 finishes.
-    1.  Is Customer found?  →  Yes path only (No = already in error).
-    2.  TP003 – Customer Specific Delivery Date Calculation.
-    3.  AF006 – Delivery-Date Validations.
-    4.  TP005 – GLN Code Retrieval (feeds into Phase 9 chain).
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-    customer_found: bool = bool(po.get("customer_found") or po.get("validated_customer"))
-
-    if not customer_found:
-        # ── SQL / Azure ──
-        azure_func_hitl_log(f"[Phase 7] Customer not found for PO {po_guid}. Stopping.")
-        return
-
-    # ─── TP003 | Customer Specific Delivery Date Calculation ───
-    # ── SQL / Azure ──  (reads customer-specific lead-time rules from master)
-    # Actual calculation is done inside AF006; TP003 is the trigger step.
-
-    # ─── AF006 | Perform Customer Specific Delivery Date Validations ───
-    phase_8_af006_delivery_date_validation(po_guid)
-
-    # ─── TP005 | GLN Code Retrieval  →  feeds Phase 9 ───
-    phase_9_gln_common_duplicate(po_guid)
-
-
-# ===========================================================================
-# PHASE 8  –  AF006  DELIVERY-DATE VALIDATION  (Image 12)
-#             Implements validate_uae_delivery_date (provided)
-# ===========================================================================
-
-def phase_8_af006_delivery_date_validation(po_guid: str) -> None:
-    """
-    Triggered by agent with PO GUID.
-    1.  Gets customer name from PO table.
-    2.  Checks alias.
-    3.  Applies the provided validate_uae_delivery_date logic.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-
-    customer_name: str | None        = po.get("validated_customer_name")
-    alias_name: str | None           = po.get("alias_name")
-    extracted_delivery_date          = po.get("extr_delivery_date")   # may be date | None
-    po_delivery_date                 = po.get("po_delivery_date")     # fallback date | None
-
-    # ─── Check If Alias Not Null  ───
-    # (flowchart only shows the Yes branch continuing; No is an implicit pass-through)
-
-    # ── Provided validation: validate_uae_delivery_date ──
-    if alias_name:
-        if customer_name and "EV" in customer_name.upper():
-            if extracted_delivery_date is None:
-                # Default to tomorrow
-                # ── SQL / Azure ──
-                sql_update_po(po_guid, vdd=date.today() + timedelta(days=1))
-                return
-            # ── SQL / Azure ──
-            sql_update_po(po_guid, vdd=extracted_delivery_date)
-            return
-
-    # Non-EV / no alias
-    if extracted_delivery_date is not None:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, vdd=extracted_delivery_date)
-        return
-
-    # ── SQL / Azure ──
-    azure_func_hitl_log("Extracted Delivery Date Not Found Error")
-
-    if po_delivery_date is not None:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, vdd=po_delivery_date)
-
-
-# ===========================================================================
-# PHASE 9  –  GLN + COMMON + DUPLICATE VALIDATION CHAIN  (Images 13-14)
-#             Implements validate_po_gln + validate_duplicate_po (provided)
-# ===========================================================================
-
-def phase_9_gln_common_duplicate(po_guid: str) -> None:
-    """
-    Sequential chain after GLN retrieval:
-        TP005 GLN Retrieval  →  AF007 Common Validation  →  Is Success?
-            Yes  →  TP007 Duplicate Detection  →  AF003  →  Is Duplicate?
-                        No   →  TP006 POL Validations  →  AF012
-                        Yes  →  PO Validation Error
-            No   →  PO Validation Error
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-    region: str  = po.get("region", "").upper()
-    gln_present: bool = po.get("gln") is not None
-    sales_org: str | None = po.get("salesorganisation")
-    owner: str = po.get("owner", "")
-
-    # ─── TP005 | GLN Code Retrieval ───
-    # ── SQL / Azure ──  (read GLN from SalesOrgMaster or CustomerMasterData)
-    # The records list is fetched here for validate_po_gln.
-    # For SA: query by sales_org.  For UAE: query by customer.
-    if region == "SA":
-        # ── SQL / Azure ──
-        gln_records: list[dict] = sql_get_sales_org_master(sales_org or "")
+if not customer_found_status:
+    print("Customer NOT found - retrieving Ship-to-code and Sold-To-Code")
+    
+    print("ACTION: Retrieve Ship-to-code & Sold-To-Code from Customer Master Data")
+    # SQL: SELECT ShipToCode, SoldToCode FROM CustomerMasterData WHERE <criteria>
+    
+    # Check ship-to-code and sold-to-code conditions
+    has_ship_to_code = False  # SQL result check
+    has_sold_to_code = False  # SQL result check
+    
+    if not has_ship_to_code and not has_sold_to_code:
+        print("Both Ship-to-code and Sold-to-code are NULL")
+        print("ACTION: Retrieve Ship-to-code & Sold-To-Code from Customer Master Data (alternative query)")
+        
+    elif has_ship_to_code and not has_sold_to_code:
+        print("Has Ship-to-code but Sold-to-code is NULL")
+        print("ACTION: Retrieve Ship-to-code & Sold-To-Code from Customer Master Data")
+        
     else:
-        # ── SQL / Azure ──  (UAE GLN lookup – e.g. via validated_customer)
-        gln_records = sql_get_sales_org_master(sales_org or "")
+        print("Has Sold-to-code")
+        print("ACTION: Retrieve Ship-to-code & Sold-To-Code from Customer Master Data")
 
-    # ── Provided validation: validate_po_gln ──
-    _run_validate_po_gln(po_guid, region, gln_present, sales_org, gln_records)
+else:
+    print("Customer found - proceeding to next steps")
 
-    # Re-read PO to check if GLN step set an error
-    # ── SQL / Azure ──
-    po = sql_get_po(po_guid)
-    if po.get("status") == "VALIDATION_ERROR":
-        # ── SQL / Azure ──  (error already logged inside validate_po_gln)
-        return
+# -----------------------------------------------------------------------------
+# STEP 7: Region and Sales Organization Validation
+# -----------------------------------------------------------------------------
+print("\n--- Step 7: Region and Sales Organization Validation ---")
 
-    # ─── AF007 | Common Validation  →  Is Success? ───
-    # "Common Validation" is a shared check (format, required fields, etc.)
-    # ── SQL / Azure ──  (reads current PO state; returns success flag)
-    common_validation_success: bool = _af007_common_validation(po_guid)
-
-    if not common_validation_success:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status="VALIDATION_ERROR",
-                      status_reason="PO Validation Error")
-        # ── SQL / Azure ──
-        azure_func_hitl_log(f"[AF007] Common Validation failed for PO {po_guid}")
-        # Validation Error path: update status icon
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return
-
-    # ─── TP007 | Duplicate Detection Validation ───
-    # ── SQL / Azure ──
-    po = sql_get_po(po_guid)
-    extracted_po_number: str | None = po.get("extrponumber")
-
-    # ── SQL / Azure ──
-    duplicate_records: list[PORecord] = sql_list_duplicate_po(
-        extracted_po_number or "", region
-    )
-
-    # ── Provided validation: validate_duplicate_po ──
-    _run_validate_duplicate_po(po_guid, region, extracted_po_number, duplicate_records)
-
-    # ── SQL / Azure ──
-    po = sql_get_po(po_guid)
-    is_duplicate: bool = bool(po.get("is_duplicate"))
-
-    if is_duplicate:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return
-
-    # ─── AF003 | Common Validation (post-duplicate) ───
-    common_validation_success = _af003_common_validation(po_guid)
-    if not common_validation_success:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="PO Validation Error")
-        return
-
-    # ─── Is Duplicate?  →  No  →  TP006 POL Validations  →  AF012 ───
-    phase_10_af012_pol_validations(po_guid)
-
-
-# ---------------------------------------------------------------------------
-# Phase-9 helper: run validate_po_gln (provided) against current PO state
-# ---------------------------------------------------------------------------
-
-def _run_validate_po_gln(po_guid: str, region: str, gln_present: bool,
-                         sales_org: str | None,
-                         records: list[dict]) -> None:
-    """Thin wrapper that mirrors the provided validate_po_gln / sub-functions."""
-
-    def _log(msg: str):
-        # ── SQL / Azure ──
-        azure_func_hitl_log(msg)
-
-    def _update(ctx: dict):
-        # ── SQL / Azure ──
-        ctx_clean = {k: v for k, v in ctx.items() if k != "po_guid"}
-        sql_update_po(po_guid, **ctx_clean)
-
-    po_ctx: dict = {"po_guid": po_guid}
-
-    if gln_present:
-        po_ctx["status"] = "VALIDATION_COMPLETE"
-        _update(po_ctx)
-        _log("GLN already present")
-        return
-
-    if region == "SA":
-        # _validate_sa_market
-        if not sales_org:
-            _log("Sales Org is null for SA")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        if not records:
-            _log("No SalesOrg GUID found for SA")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        if len(records) != 1:
-            _log("More than one SalesOrg record found for SA")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        record = records[0]
-        if not record.get("gln"):
-            _log("GLN code not retrieved for SA")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        po_ctx["gln"] = record["gln"]
-        po_ctx["status"] = "VALIDATION_COMPLETE"
-        _update(po_ctx)
-        _log("SA GLN validation successful")
+if country_code == "SA" and po_salesorganisation is not None:
+    if po_salesorganisation != "" and po_validsalesorgnum is not None:
+        print("Region is SA, Type=Excel, salesorg not null, validsalesorgnum not null")
+        print("ACTION: Update PO with Validated - Sales Org Number eq salesorganisation value")
+        # SQL: UPDATE PurchaseOrder SET ValidatedSalesOrgNumber = po_salesorganisation WHERE PO_GUID = po_guid
+        
     else:
-        # _validate_uae_market
-        if not records:
-            _log("No matching records found for UAE")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        if len(records) != 1:
-            _log("More than one record found for UAE")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        record = records[0]
-        if not record.get("salesOrg"):
-            _log("SalesOrg missing in UAE record")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        if not record.get("gln"):
-            _log("GLN missing for UAE SalesOrg")
-            po_ctx["status"] = "VALIDATION_ERROR"
-            _update(po_ctx)
-            return
-        po_ctx["gln"] = record["gln"]
-        po_ctx["status"] = "VALIDATION_COMPLETE"
-        _update(po_ctx)
-        _log("UAE GLN validation successful")
+        print("Region is SA but conditions not met")
+        print("ACTION: Update PO with Validated - Sales Org Number eq Retrieved Sales Org value")
+        
+else:
+    print("Not SA region or salesorganisation is null")
+    print("ACTION: Update PO with Validated - Sales Org Number eq Retrieved Sales Org value")
+
+# -----------------------------------------------------------------------------
+# STEP 8: Get Customer From PO After Validation
+# -----------------------------------------------------------------------------
+print("\n--- Step 8: Get Customer From PO After Validation ---")
+
+print("ACTION: Get Customer From PO after Validation")
+# SQL: SELECT Customer FROM PurchaseOrder WHERE PO_GUID = po_guid
+
+# -----------------------------------------------------------------------------
+# STEP 9: Ship-to-code and Sales Org Validation
+# -----------------------------------------------------------------------------
+print("\n--- Step 9: Ship-to-code and Sales Org Validation ---")
+
+valid_ship_to_code_is_null = False  # SQL: Check if po_validshiptocode IS NULL
+valid_sales_org_is_null = False  # SQL: Check if po_validsalesorgnum IS NULL
+
+if valid_ship_to_code_is_null:
+    print("validshiptocode is NULL")
+    print("ACTION: Call Azure func. HITLLog - 'Validated Ship To Code - Validation Error. Check the correct value in the master data'")
+    print("ACTION: Update PO with Status Reason eq PO Validation Error")
+    # SQL: UPDATE PurchaseOrder SET StatusReason = 'PO Validation Error' WHERE PO_GUID = po_guid
+    
+elif valid_sales_org_is_null:
+    print("validsalesorgnum is NULL")
+    print("ACTION: Call Azure func. HITLLog - 'Validated Sales Org - Validation Error. Check the correct value in the master data'")
+    print("ACTION: Update PO with Status Reason eq PO Validation Error")
+    
+else:
+    print("Both validshiptocode and validsalesorgnum are NOT NULL")
+    print("Proceeding to copilot response")
+
+# -----------------------------------------------------------------------------
+# STEP 10: After AF004 Response - Customer Found Check
+# -----------------------------------------------------------------------------
+print("\n--- Step 10: After AF004 Response ---")
+
+print("After AF004 response from above flow")
+print("Copilot continue")
+
+customer_found_final = True  # This should be set based on all previous validations
+
+if customer_found_final:
+    print("Customer IS found")
+    
+    # Call UAE specific functions
+    print("ACTION: Call UAE | TPD03 | Customer Specific Delivery Date Calculation")
+    print("ACTION: Call AF006 | UAE Agent | Perform Customer Specific Delivery Date Validations")
+
+else:
+    print("Customer NOT found - skipping delivery date calculations")
+
+# -----------------------------------------------------------------------------
+# STEP 11: AF006 - Customer Specific Delivery Date Validations
+# -----------------------------------------------------------------------------
+print("\n--- Step 11: AF006 - Delivery Date Validations ---")
+
+print("AF006 | UAE Agent | Perform Customer Specific Delivery Date Validations")
+print("Triggered by Agent Input: PO GUID")
+
+# Get Customer name from current PO
+print("ACTION: Get Customer name of current PO from PO table")
+# SQL: SELECT CustomerName FROM PurchaseOrder WHERE PO_GUID = po_guid
+
+# Check if Alias is NOT NULL
+alias_not_null = False  # SQL: Check po_alias IS NOT NULL
+
+if alias_not_null:
+    print("Alias is NOT NULL")
+    # Validation flow continues
+    
+else:
+    print("Alias is NULL")
+    # Continue with alternative flow
+
+# -----------------------------------------------------------------------------
+# STEP 12: GLN Code Retrieval and Common Validations
+# -----------------------------------------------------------------------------
+print("\n--- Step 12: GLN Code Retrieval ---")
+
+print("ACTION: Call UAE | TPD05 | GLN Code Retrieval")
+
+# Call Azure function for GLN code retrieval
+print("ACTION: Call AF007 | Common Validation")
+# azure_func_gln_response = call_azure_function("GLN_Code_Retrieval", params)
+
+# Check success
+gln_success = True  # From azure_func_gln_response['success']
+
+if gln_success:
+    print("GLN Code Retrieval successful")
+    print("ACTION: Call UAE | TPd97 | Duplicate Detection Validation")
+    print("ACTION: Call AF003 | Common Validations | Duplicate Detection Validation")
+    
+else:
+    print("GLN Code Retrieval failed")
+    print("ACTION: Update PO status to PO Validation Error")
+
+# -----------------------------------------------------------------------------
+# STEP 13: AF003 - Duplicate Detection Validation
+# -----------------------------------------------------------------------------
+print("\n--- Step 13: AF003 - Duplicate Detection ---")
+
+print("AF003 | Common Validations | Duplicate Detection Validation")
+print("Triggered by agent input: PO Guid")
+
+# Get PO Number From PO
+print("ACTION: Get PO Number From PO")
+# SQL: SELECT PONumber FROM PurchaseOrder WHERE PO_GUID = po_guid
+
+# Check if region is UAE
+if country_code == "UAE":
+    print("Region is UAE")
+    
+    # Check if Extracted PO Number is not null
+    if po_extracted_number is not None and po_extracted_number != "":
+        print("Extracted PO Number is not null")
+        
+        # List Duplicate PO
+        print("ACTION: List Duplicate PO")
+        # SQL: SELECT * FROM PurchaseOrder WHERE PONumber = po_extracted_number AND PO_GUID != po_guid
+        
+        duplicate_count = 0  # SQL: COUNT from above query
+        
+        if duplicate_count > 1:
+            print(f"Duplicate count > 1: {duplicate_count}")
+            is_duplicate = True
+            
+        else:
+            print("No duplicates or single record")
+            is_duplicate = False
+            
+    else:
+        print("Extracted PO Number is null - no duplicate check needed")
+        
+else:
+    print("Region is not UAE - different duplicate logic may apply")
+
+# -----------------------------------------------------------------------------
+# STEP 14: POL Validations (if not duplicate)
+# -----------------------------------------------------------------------------
+print("\n--- Step 14: POL Validations ---")
+
+if not is_duplicate:
+    print("Not a duplicate - proceeding with POL validations")
+    print("ACTION: Call UAE | TPd04 | POL Validations")
+    print("ACTION: Call AF012 | UAE Agent |")
+    
+else:
+    print("Duplicate detected - skipping POL validations")
+
+# -----------------------------------------------------------------------------
+# STEP 15: AF012 - POL UAE Initiate Validations
+# -----------------------------------------------------------------------------
+print("\n--- Step 15: AF012 - POL UAE Validations ---")
+
+print("AF012 | UAE Agent | Initiate POL Validations")
+print("When an agent calls the flow")
+
+# Call Azure function POL_UAE
+print("ACTION: Call Azure func. POL_UAE ('poGuid': IP_PO_Guid)")
+# azure_func_pol_response = call_azure_function("POL_UAE", {"poGuid": po_guid})
+
+# Check Response Success
+pol_response_success = True  # From azure_func_pol_response['success']
+
+if not pol_response_success:
+    print("POL Response NOT successful")
+    print("ACTION: Update PO with Status Reason: POL Validation Error")
+    # SQL: UPDATE PurchaseOrder SET StatusReason = 'POL Validation Error' WHERE PO_GUID = po_guid
+    
+else:
+    print("POL Response successful")
+    print("ACTION: Response as Json")
+
+# =============================================================================
+# FLOW COMPLETION
+# =============================================================================
+
+print("\n=== PO Validation Flow Complete ===")
+print(f"Final Status: {'Success' if validation_success else 'Failed'}")
+print(f"Is Duplicate: {is_duplicate}")
 
 
-# ---------------------------------------------------------------------------
-# Phase-9 helper: run validate_duplicate_po (provided)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SQL QUERY PLACEHOLDERS SUMMARY
+# =============================================================================
+"""
+LIST OF SQL QUERIES TO BE IMPLEMENTED:
 
-def _run_validate_duplicate_po(po_guid: str, region: str,
-                               extracted_po_number: str | None,
-                               duplicate_records: list[PORecord]) -> None:
+1. Initial PO Data Fetch:
+   SELECT po_guid, po_status_code, extpronumber, country_code, po_extracted_number,
+          po_salesorganisation, po_shiptocode, po_soldtocode, po_validshiptocode,
+          po_validsalesorgnum, po_customer_name, po_alias
+   FROM PurchaseOrder 
+   WHERE PO_GUID = @po_guid
 
-    def _log(msg: str):
-        # ── SQL / Azure ──
-        azure_func_hitl_log(msg)
+2. Customer Master Data Query:
+   SELECT accountid, shiptocode, statecode, exttrustaccnum
+   FROM CustomerMasterData
+   WHERE ShipToCode = @po_shiptocode AND StateCode = @statecode
 
-    def _update(ctx: dict):
-        # ── SQL / Azure ──
-        ctx_clean = {k: v for k, v in ctx.items() if k != "po_guid"}
-        sql_update_po(po_guid, **ctx_clean)
+3. Sales Organization Master Data:
+   SELECT Name, SalesOrganisation, filetype
+   FROM SalesOrgMasterData
+   WHERE SalesOrganisation = @po_salesorganisation
 
-    po_ctx: dict = {"po_guid": po_guid}
+4. Update PO Status:
+   UPDATE PurchaseOrder 
+   SET POSetup = @setup_status,
+       StatusReason = @status_reason,
+       ValidatedCustomer = @customer_id,
+       ValidatedSalesOrgNumber = @sales_org,
+       ValidatedShipToCode = @ship_to_code
+   WHERE PO_GUID = @po_guid
 
-    if not extracted_po_number:
-        _log(
-            "Extracted Purchase Order Number - Extraction Error, "
-            "please check the Purchase Order Copy and update the value"
-        )
-        po_ctx["status"] = "PO_EXTRACTION_ERROR"
-        _update(po_ctx)
-        return
+5. Insert High Confidence Match:
+   INSERT INTO HighConfidenceCustomerMatches 
+   (Name, Customer, Teams, PO, Threshold)
+   VALUES (@name, @customer_id, @owner, @po_guid, @threshold)
 
-    duplicate_count = len(duplicate_records)
-    if duplicate_count <= 1:
-        po_ctx["validated_po_number"] = extracted_po_number
-        po_ctx["is_duplicate"] = False
-        _update(po_ctx)
-        _log("PO Validation Complete - There are no duplicates, proceeding to the next action")
-        return
+6. Insert Moderate Confidence Match:
+   INSERT INTO ModerateConfidenceCustomerMatches 
+   (Name, ResponseBodyName, Customer, bodyObjectId, Teams, Owner, PO, Threshold, Body, Similarity)
+   VALUES (@name, @response_name, @customer, @object_id, @teams, @owner, @po_guid, @threshold, @body, @similarity)
 
-    po_ctx["validated_po_number"] = extracted_po_number
-    po_ctx["is_duplicate"] = True
-    po_ctx["status"] = "DUPLICATE_PO"
-    _update(po_ctx)
-    _log(
-        "PO Validation Error: Duplicate PO detected. "
-        "Multiple purchase orders found with the same PO number. "
-        "Please review and confirm the appropriate action"
-    )
+7. Duplicate Detection Query:
+   SELECT COUNT(*) as duplicate_count
+   FROM PurchaseOrder
+   WHERE PONumber = @po_number AND PO_GUID != @current_po_guid
 
+8. Retrieve Ship-to and Sold-to Codes:
+   SELECT ShipToCode, SoldToCode
+   FROM CustomerMasterData
+   WHERE <matching_criteria>
 
-# ---------------------------------------------------------------------------
-# Phase-9 helpers: AF007 / AF003 Common Validation stubs
-# ---------------------------------------------------------------------------
-
-def _af007_common_validation(po_guid: str) -> bool:
-    """
-    AF007 – Common Validation (pre-duplicate check).
-    Reads PO, checks required fields / formats.
-
-    ── SQL / Azure ──
-    Replace with actual validation logic reading from Azure SQL.
-    Returns True if all checks pass.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-    # Placeholder: assume success if PO exists and has no prior error
-    return po.get("status") != "VALIDATION_ERROR"
-
-
-def _af003_common_validation(po_guid: str) -> bool:
-    """
-    AF003 – Common Validation (post-duplicate check).
-    Same structure as AF007; different trigger point in the chain.
-
-    ── SQL / Azure ──
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-    return po.get("status") != "VALIDATION_ERROR"
-
-
-# ===========================================================================
-# PHASE 10  –  AF012  POL VALIDATIONS  (Image 14)
-# ===========================================================================
-
-def phase_10_af012_pol_validations(po_guid: str) -> None:
-    """
-    Triggered when agent calls the flow (or after TP006 POL Validations step).
-    Calls Azure Function POL_UAE with the PO GUID.
-
-        Response Success?
-            Yes  →  Response as JSON (downstream consumer picks up)
-            No   →  Update PO Status Reason: POL Validation Error
-    """
-    # ── SQL / Azure ──
-    pol_response: dict[str, Any] = azure_func_pol_uae(po_guid)
-
-    if not pol_response.get("success", False):
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status_reason="POL Validation Error")
-        # ── SQL / Azure ──
-        azure_func_hitl_log(f"[AF012] POL Validation Error for PO {po_guid}")
-        return
-
-    # Success – response is available as JSON for the caller.
-    # ── SQL / Azure ──
-    azure_func_hitl_log(f"[AF012] POL Validation Success for PO {po_guid}")
-
-
-# ===========================================================================
-# PHASE 11  –  AF003  DUPLICATE DETECTION  (Image 15)
-#             (Region-aware entry; already wired inside Phase 9, but exposed
-#              here as the standalone AF003 flow for direct invocation)
-# ===========================================================================
-
-def phase_11_af003_duplicate_detection(po_guid: str) -> bool:
-    """
-    AF003 | Common Validations | Duplicate Detection Validation
-    Triggered by agent input PO GUID.
-
-    Returns True if a duplicate is detected.
-    """
-    # ── SQL / Azure ──
-    po: PORecord = sql_get_po(po_guid)
-
-    region: str = po.get("region", "").upper()
-    extracted_po_number: str | None = po.get("extrponumber")
-
-    # ─── Get PO Number From PO  →  already have it ───
-
-    # ─── Check if region is UAE ───
-    if region != "UAE":
-        # Non-UAE path: if Extracted PO Number is not null → list duplicates
-        if extracted_po_number is None:
-            # ── SQL / Azure ──
-            azure_func_hitl_log(
-                "Extracted Purchase Order Number - Extraction Error, "
-                "please check the Purchase Order Copy and update the value"
-            )
-            # ── SQL / Azure ──
-            sql_update_po(po_guid, status="PO_EXTRACTION_ERROR")
-            return False
-
-        # ── SQL / Azure ──
-        duplicate_records = sql_list_duplicate_po(extracted_po_number, region)
-
-        # length > 1  →  duplicate
-        if len(duplicate_records) > 1:
-            # ── SQL / Azure ──
-            sql_update_po(po_guid, is_duplicate=True, status="DUPLICATE_PO")
-            # ── SQL / Azure ──
-            azure_func_hitl_log(
-                "PO Validation Error: Duplicate PO detected. "
-                "Multiple purchase orders found with the same PO number. "
-                "Please review and confirm the appropriate action"
-            )
-            return True
-
-        # No duplicate
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, is_duplicate=False,
-                      validated_po_number=extracted_po_number)
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "PO Validation Complete - There are no duplicates, "
-            "proceeding to the next action"
-        )
-        return False
-
-    # ─── UAE-specific duplicate check ───
-    # Same logic, region = "UAE"
-    if extracted_po_number is None:
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "Extracted Purchase Order Number - Extraction Error, "
-            "please check the Purchase Order Copy and update the value"
-        )
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, status="PO_EXTRACTION_ERROR")
-        return False
-
-    # ── SQL / Azure ──
-    duplicate_records = sql_list_duplicate_po(extracted_po_number, "UAE")
-
-    if len(duplicate_records) > 1:
-        # ── SQL / Azure ──
-        sql_update_po(po_guid, is_duplicate=True, status="DUPLICATE_PO")
-        # ── SQL / Azure ──
-        azure_func_hitl_log(
-            "PO Validation Error: Duplicate PO detected. "
-            "Multiple purchase orders found with the same PO number. "
-            "Please review and confirm the appropriate action"
-        )
-        return True
-
-    # ── SQL / Azure ──
-    sql_update_po(po_guid, is_duplicate=False,
-                  validated_po_number=extracted_po_number)
-    # ── SQL / Azure ──
-    azure_func_hitl_log(
-        "PO Validation Complete - There are no duplicates, "
-        "proceeding to the next action"
-    )
-    return False
-
-
-# ===========================================================================
-# TOP-LEVEL ORCHESTRATOR
-# ===========================================================================
-
-def run_full_po_pipeline(po_guid: str, copilot_message: str = "") -> None:
-    """
-    Single entry point that executes the complete Purchase Order pipeline.
-
-    Typical invocation sequence:
-        Phase 0  →  Phase 1  →  Phase 2  →  (3 → 4 if needed)
-                                          →  Phase 5  →  Phase 6
-                                →  Phase 7  →  Phase 8  →  Phase 9
-                                                              →  Phase 10
-
-    Parameters
-    ----------
-    po_guid          : GUID of the Purchase Order row in Azure SQL.
-    copilot_message  : Raw message text from the Copilot; checked for
-                       "reprocess" keyword in Phase 1.
-    """
-    # ── Phase 0: extraction trigger (normally fired by Power Automate / event) ──
-    region = phase_0_po_extraction_trigger(po_guid)
-
-    if region != "UAE":
-        # SA agent path is a mirror; extend as needed.
-        return
-
-    # ── Phase 1 already called inside Phase 0 for UAE; but if invoked
-    #    directly by Copilot with a message we re-enter here:
-    #    phase_1_uae_agent_entry(po_guid, copilot_message)
-
-    # ── Phase 7 is the Copilot continuation after AF004 responds ──
-    phase_7_post_af004_continuation(po_guid)
-
-
-# ===========================================================================
-# QUICK SMOKE-TEST  (runs with mocked stubs – no real Azure calls)
-# ===========================================================================
-
-if __name__ == "__main__":
-    import json
-
-    # ── Mock store ──
-    _store: dict[str, PORecord] = {}
-    _logs: list[str] = []
-
-    # Patch stubs with in-memory mocks
-    def _mock_get_po(po_guid):
-        return _store.setdefault(po_guid, {
-            "extrponumber": "NOVA-02-03-2026-0001",
-            "country": "UAE",
-            "region": "UAE",
-            "extrcustaccnum": "CUST-001",
-            "salesorganisation": "SO-100",
-            "orderfiletype": "PDF",
-            "extrcustname": "Acme Corp",
-            "extrdeliveryaddr": "Dubai, UAE",
-            "validcustname": None,
-            "owner": "TeamA",
-            "customer_found": False,
-            "validated_customer": None,
-            "alias_name": None,
-            "extr_delivery_date": None,
-            "po_delivery_date": date(2026, 2, 10),
-            "gln": None,
-            "validshiptocode": "STC-1",
-            "validsalesorgnum": "SON-1",
-        })
-
-    def _mock_update_po(po_guid, **fields):
-        store = _store.setdefault(po_guid, {})
-        store.update(fields)
-
-    def _mock_cmd_shipto(ship_to_code, state_code=0):
-        return [{"accountId": "ACC-001", "shipToCode": ship_to_code,
-                 "soldToCode": "SOLD-001"}]
-
-    def _mock_sales_org(name):
-        return [{"accountId": "ACC-SO-1", "shipToCode": "STC-1",
-                 "gln": "GLN-123", "salesOrg": name}]
-
-    def _mock_log(msg):
-        _logs.append(msg)
-        print(f"  [LOG] {msg}")
-
-    def _mock_dataverse(*a, **kw):
-        return {"strongCount": 1, "mediumCount": 0, "highCount": 0, "total": 1,
-                "body": [{"threshold": "Strong", "objectId": "OBJ-1",
-                          "validcutname": "Acme", "bodyObjectId": "BODY-1"}]}
-
-    def _mock_pol_uae(po_guid):
-        return {"success": True, "data": {"polStatus": "OK"}}
-
-    def _mock_list_dup(po_num, region):
-        return [{"guid": "x"}]  # only 1 → not duplicate
-
-    def _mock_autonumber(prefix):
-        today = date.today()
-        return f"{prefix}-{today.month:02d}-{today.day:02d}-{today.year}-0001"
-
-    # Monkey-patch – overwrite every stub in the current module's globals
-    import sys
-    _mod = sys.modules[__name__]
-    _mod.sql_get_po                          = _mock_get_po
-    _mod.sql_update_po                       = _mock_update_po
-    _mod.sql_get_cmd_by_shipto               = _mock_cmd_shipto
-    _mod.sql_get_sales_org_master            = _mock_sales_org
-    _mod.sql_get_cmd_by_soldto               = lambda c: _mock_cmd_shipto(c)
-    _mod.sql_get_cmd_by_shipto_code          = lambda c: _mock_cmd_shipto(c)
-    _mod.sql_create_hccm                     = lambda *a, **kw: None
-    _mod.sql_create_mccm                     = lambda *a, **kw: None
-    _mod.sql_list_duplicate_po               = _mock_list_dup
-    _mod.azure_func_hitl_log                 = _mock_log
-    _mod.azure_func_find_customer_dataverse  = _mock_dataverse
-    _mod.azure_func_pol_uae                  = _mock_pol_uae
-    _mod.sql_get_next_autonumber             = _mock_autonumber
-
-    # Also update the module-level names so in-function calls resolve correctly
-    globals()["sql_get_po"]                          = _mock_get_po
-    globals()["sql_update_po"]                       = _mock_update_po
-    globals()["sql_get_cmd_by_shipto"]               = _mock_cmd_shipto
-    globals()["sql_get_sales_org_master"]            = _mock_sales_org
-    globals()["sql_get_cmd_by_soldto"]               = lambda c: _mock_cmd_shipto(c)
-    globals()["sql_get_cmd_by_shipto_code"]          = lambda c: _mock_cmd_shipto(c)
-    globals()["sql_create_hccm"]                     = lambda *a, **kw: None
-    globals()["sql_create_mccm"]                     = lambda *a, **kw: None
-    globals()["sql_list_duplicate_po"]               = _mock_list_dup
-    globals()["azure_func_hitl_log"]                 = _mock_log
-    globals()["azure_func_find_customer_dataverse"]  = _mock_dataverse
-    globals()["azure_func_pol_uae"]                  = _mock_pol_uae
-    globals()["sql_get_next_autonumber"]             = _mock_autonumber
-
-    TEST_GUID = "test-po-guid-001"
-    print("=" * 60)
-    print(" Running full pipeline smoke-test")
-    print("=" * 60)
-
-    try:
-        run_full_po_pipeline(TEST_GUID)
-    except Exception as exc:
-        print(f"\n  [!] Stopped at: {exc}")
-
-    print("\n" + "-" * 60)
-    print(" Final PO state:")
-    print(json.dumps(_store.get(TEST_GUID, {}), indent=2, default=str))
-    print("-" * 60)
-    print(f" Total log entries: {len(_logs)}")
+All Azure Function calls should be implemented as separate API calls:
+- FindCustomerDataUsingDataverseSearch
+- POL_UAE
+- GLN_Code_Retrieval
+- HITLLog (for logging validation errors)
+"""
