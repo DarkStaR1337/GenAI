@@ -1,0 +1,1112 @@
+"""
+Delivery Date Validation Flow - Converted from Power Automate
+Validates sales orders based on delivery type, region, and master data
+"""
+
+import pyodbc
+import logging
+from datetime import datetime
+from enum import Enum
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class DeliveryType(Enum):
+    SDD = "SDD"  # Same Day Delivery
+    NDD = "NDD"  # Next Day Delivery
+    UNKNOWN = "UNKNOWN"
+
+
+class VDDType(Enum):
+    IT = "IT"
+    GT = "GT"
+    LT = "LT"
+
+
+class ValidationResult:
+    def __init__(self):
+        self.is_valid = True
+        self.errors = []
+        self.warnings = []
+        self.updates = []
+        self.audit_logs = []
+    
+    def add_error(self, error_message):
+        self.is_valid = False
+        self.errors.append(error_message)
+        logger.error(error_message)
+    
+    def add_warning(self, warning_message):
+        self.warnings.append(warning_message)
+        logger.warning(warning_message)
+    
+    def add_update(self, update_message):
+        self.updates.append(update_message)
+        logger.info(update_message)
+    
+    def add_audit_log(self, log_entry):
+        self.audit_logs.append(log_entry)
+
+
+class DeliveryDateValidator:
+    def __init__(self, connection_string):
+        self.connection_string = connection_string
+        self.conn = None
+    
+    def connect(self):
+        """Establish database connection"""
+        try:
+            self.conn = pyodbc.connect(self.connection_string)
+            logger.info("Database connection established")
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            raise
+    
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
+            logger.info("Database connection closed")
+    
+    def get_sales_order(self, sales_order_id):
+        """Fetch sales order details"""
+        query = """
+        SELECT 
+            sales_order_id,
+            created_on_email,
+            region,
+            ship_to_code,
+            ship_to_category,
+            delivery_type,
+            order_placed_date,
+            vdd_hitl
+        FROM sales_orders
+        WHERE sales_order_id = ?
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(query, (sales_order_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        return result
+    
+    def get_purchase_order(self, sales_order_id):
+        """Fetch associated purchase order region"""
+        query = """
+        SELECT region
+        FROM purchase_orders
+        WHERE sales_order_id = ?
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(query, (sales_order_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        return result[0] if result else None
+    
+    def get_country_master_data(self, region):
+        """Fetch country master data"""
+        query = """
+        SELECT 
+            region,
+            country_code,
+            country_name
+        FROM country_master_data
+        WHERE region = ?
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(query, (region,))
+        result = cursor.fetchone()
+        cursor.close()
+        return result
+    
+    def get_ship_to_data(self, ship_to_code):
+        """Fetch ship to master data"""
+        query = """
+        SELECT 
+            ship_to_code,
+            ship_to_category,
+            description
+        FROM ship_to_master_data
+        WHERE ship_to_code = ?
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(query, (ship_to_code,))
+        result = cursor.fetchone()
+        cursor.close()
+        return result
+    
+    def update_sales_order(self, sales_order_id, updates):
+        """Update sales order with new values"""
+        cursor = self.conn.cursor()
+        try:
+            update_fields = []
+            params = []
+            
+            for field, value in updates.items():
+                update_fields.append(f"{field} = ?")
+                params.append(value)
+            
+            params.append(sales_order_id)
+            
+            query = f"""
+            UPDATE sales_orders
+            SET {', '.join(update_fields)}
+            WHERE sales_order_id = ?
+            """
+            
+            cursor.execute(query, params)
+            self.conn.commit()
+            logger.info(f"Updated sales order {sales_order_id}: {updates}")
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Failed to update sales order: {e}")
+        finally:
+            cursor.close()
+    
+    def add_audit_log(self, sales_order_id, action, description, vdd_value=None):
+        """Add entry to audit log"""
+        cursor = self.conn.cursor()
+        try:
+            query = """
+            INSERT INTO audit_log (sales_order_id, action, description, vdd_value, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """
+            cursor.execute(query, (sales_order_id, action, description, vdd_value, datetime.now()))
+            self.conn.commit()
+            logger.info(f"Audit log added for SO {sales_order_id}: {action}")
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Failed to add audit log: {e}")
+        finally:
+            cursor.close()
+    
+    def validate_sales_order(self, sales_order_id):
+        """Main validation logic"""
+        result = ValidationResult()
+        
+        # Step 1: Get sales order details
+        so = self.get_sales_order(sales_order_id)
+        if not so:
+            result.add_error(f"Sales order {sales_order_id} not found")
+            return result
+        
+        so_data = {
+            'id': so[0],
+            'created_on_email': so[1],
+            'region': so[2],
+            'ship_to_code': so[3],
+            'ship_to_category': so[4],
+            'delivery_type': so[5],
+            'order_placed_date': so[6],
+            'vdd_hitl': so[7]
+        }
+        
+        logger.info(f"Processing sales order: {so_data}")
+        
+        # Step 2: Check if SA and VDD is Null
+        if so_data['vdd_hitl'] is None:
+            logger.info("SA and VDD is Null - proceeding with condition 3")
+            result = self._process_vdd_null_condition(so_data, result)
+        else:
+            logger.info(f"VDD is not null: {so_data['vdd_hitl']} - skipping")
+        
+        return result
+    
+    def _process_vdd_null_condition(self, so_data, result):
+        """Process when SA and VDD is Null"""
+        
+        # Condition 3: Check specific region and ship_to validations
+        if so_data['region'] == 'United Arab Emirates':
+            logger.info("Region is UAE - checking ship_to code and category")
+            
+            # Check if ship_to_code and category are not null
+            if so_data['ship_to_code'] and so_data['ship_to_category']:
+                logger.info("Ship to code and category present - checking for master data")
+                
+                ship_to_data = self.get_ship_to_data(so_data['ship_to_code'])
+                
+                if not ship_to_data:
+                    # Master data not found
+                    result.add_error(f"Master data not found for ship_to_code: {so_data['ship_to_code']}")
+                    result.add_update(f"Add new record to Audit Log (Master Data Missing) for SO: {so_data['id']}")
+                    self.add_audit_log(
+                        so_data['id'],
+                        'SO Validation Error - Ship To Master Data Missing',
+                        f"No master data found for ship_to_code: {so_data['ship_to_code']}",
+                        None
+                    )
+                else:
+                    logger.info("Ship to master data found - proceeding with delivery type validation")
+                    result = self._validate_delivery_type(so_data, result)
+            else:
+                result.add_error(f"Ship to code or category is null for SO: {so_data['id']}")
+        else:
+            logger.info(f"Region {so_data['region']} is not UAE - proceeding with delivery type validation")
+            result = self._validate_delivery_type(so_data, result)
+        
+        return result
+    
+    def _validate_delivery_type(self, so_data, result):
+        """Validate based on delivery type"""
+        
+        delivery_type = so_data['delivery_type']
+        
+        if delivery_type == 'SDD':
+            logger.info("Delivery type is SDD - checking order placed date")
+            result = self._validate_sdd_delivery(so_data, result)
+        
+        elif delivery_type == 'NDD':
+            logger.info("Delivery type is NDD - checking order placed date")
+            result = self._validate_ndd_delivery(so_data, result)
+        
+        else:
+            logger.info(f"No delivery type validation for: {delivery_type}")
+            result = self._validate_no_delivery_type(so_data, result)
+        
+        return result
+    
+    def _validate_sdd_delivery(self, so_data, result):
+        """Validate Same Day Delivery"""
+        
+        # Check if delivery type is SDD and order placed date is 2pm specific
+        order_time = so_data['order_placed_date']
+        
+        if order_time and order_time.hour == 14:  # 2pm
+            logger.info("Order placed at 2pm - valid for SDD")
+            
+            # Update sales order with VDD value
+            self.update_sales_order(so_data['id'], {'vdd_hitl': 'IT'})
+            result.add_update(f"Updated SO {so_data['id']} with VDD: IT")
+            
+            # Execute SAP integration
+            self._execute_sap_integration(so_data['id'], 'SDD 2pm', result)
+        
+        else:
+            logger.info("Order not placed at valid SDD time - checking NDD conditions")
+            result = self._validate_sdd_special_times(so_data, result)
+        
+        return result
+    
+    def _validate_sdd_special_times(self, so_data, result):
+        """Validate SDD with special time conditions"""
+        
+        order_time = so_data['order_placed_date']
+        
+        # SDD at 3pm (gt 2pm)
+        if order_time and order_time.hour == 15:  # 3pm
+            logger.info("Order placed at 3pm - checking for NDD validation")
+            
+            # This would be for NDD, not SDD
+            self._validate_ndd_special_case(so_data, result, "SDD->NDD at 3pm")
+        
+        else:
+            # Default case - no delivery type found
+            logger.warning("No valid delivery time found")
+            result.add_warning(f"Unable to determine valid delivery parameters for SO: {so_data['id']}")
+        
+        return result
+    
+    def _validate_ndd_delivery(self, so_data, result):
+        """Validate Next Day Delivery"""
+        
+        order_time = so_data['order_placed_date']
+        
+        if order_time and order_time.hour == 15:  # 3pm (LT 4pm)
+            logger.info("Order placed before 4pm - valid for NDD LT")
+            
+            # Update with NDD LT vdd
+            self.update_sales_order(so_data['id'], {'vdd_hitl': 'LT'})
+            result.add_update(f"Updated SO {so_data['id']} with VDD: LT")
+            
+            # Execute SAP integration
+            self._execute_sap_integration(so_data['id'], 'NDD LT', result)
+        
+        else:
+            logger.info("Order not in NDD LT window - checking GT conditions")
+            result = self._validate_ndd_special_times(so_data, result)
+        
+        return result
+    
+    def _validate_ndd_special_times(self, so_data, result):
+        """Validate NDD with special time conditions"""
+        
+        order_time = so_data['order_placed_date']
+        
+        # NDD at 4pm (GT condition)
+        if order_time and order_time.hour == 16:  # 4pm
+            logger.info("Order placed at 4pm - checking for GT condition")
+            
+            self.update_sales_order(so_data['id'], {'vdd_hitl': 'GT'})
+            result.add_update(f"Updated SO {so_data['id']} with VDD: GT")
+            
+            # Execute SAP integration
+            self._execute_sap_integration(so_data['id'], 'NDD GT', result)
+        
+        else:
+            logger.warning("No valid NDD time found")
+            result.add_warning(f"Order time {order_time} does not match NDD conditions")
+        
+        return result
+    
+    def _validate_ndd_special_case(self, so_data, result, case_type):
+        """Validate special NDD cases from SDD transitions"""
+        
+        logger.info(f"Processing special case: {case_type}")
+        self.update_sales_order(so_data['id'], {'vdd_hitl': 'LT'})
+        result.add_update(f"Updated SO {so_data['id']} with VDD: LT (Special case)")
+        
+        # Execute SAP integration
+        self._execute_sap_integration(so_data['id'], case_type, result)
+        
+        return result
+    
+    def _validate_no_delivery_type(self, so_data, result):
+        """Handle case where there is no delivery type"""
+        
+        logger.info("No delivery type found - checking for any delivery type")
+        
+        # Check if there is no delivery type and trigger error handling
+        if not so_data['delivery_type']:
+            logger.warning(f"No delivery type for SO: {so_data['id']}")
+            result.add_warning(f"Delivery type is missing for SO: {so_data['id']}")
+            
+            # Add audit log
+            self.add_audit_log(
+                so_data['id'],
+                'Missing Delivery Type',
+                'Order has no delivery type specified',
+                None
+            )
+        
+        return result
+    
+    def _execute_sap_integration(self, sales_order_id, scenario, result):
+        """Execute SAP Integration Agent"""
+        
+        logger.info(f"Executing SAP Integration for SO {sales_order_id} - Scenario: {scenario}")
+        
+        # This would call your SAP Integration Agent
+        # For now, we'll simulate the call
+        try:
+            # SAP_Integration_Agent(sales_order_id, scenario)
+            result.add_update(f"SAP Integration executed for SO {sales_order_id} ({scenario})")
+            
+            # Add audit log for successful execution
+            self.add_audit_log(
+                sales_order_id,
+                'SAP Integration Executed',
+                f'Successfully executed SAP integration: {scenario}',
+                None
+            )
+        except Exception as e:
+            logger.error(f"SAP Integration failed: {e}")
+            result.add_error(f"SAP Integration failed for SO {sales_order_id}: {e}")
+
+
+# Example usage
+def main():
+    # Connection string for SQL Server
+    # Adjust based on your database setup
+    connection_string = (
+        'Driver={ODBC Driver 17 for SQL Server};'
+        'Server=YOUR_SERVER;'
+        'Database=YOUR_DATABASE;'
+        'UID=YOUR_USERNAME;'
+        'PWD=YOUR_PASSWORD;'
+    )
+    
+    try:
+        validator = DeliveryDateValidator(connection_string)
+        validator.connect()
+        
+        # Validate a sales order
+        sales_order_id = 'SO-001'  # Replace with actual SO ID
+        result = validator.validate_sales_order(sales_order_id)
+        
+        # Print results
+        print("\n" + "="*60)
+        print("VALIDATION RESULTS")
+        print("="*60)
+        print(f"Valid: {result.is_valid}")
+        
+        if result.errors:
+            print("\nErrors:")
+            for error in result.errors:
+                print(f"  - {error}")
+        
+        if result.warnings:
+            print("\nWarnings:")
+            for warning in result.warnings:
+                print(f"  - {warning}")
+        
+        if result.updates:
+            print("\nUpdates:")
+            for update in result.updates:
+                print(f"  - {update}")
+        
+        if result.audit_logs:
+            print("\nAudit Logs:")
+            for log in result.audit_logs:
+                print(f"  - {log}")
+        
+        validator.close()
+    
+    except Exception as e:
+        logger.error(f"Validation process failed: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
+
+
+"""
+Simplified If/Else Version - Delivery Date Validation Flow
+Direct conversion of Power Automate flow to basic Python
+"""
+
+import pyodbc
+from datetime import datetime
+
+class SimpleDeliveryValidator:
+    """Simplified, straightforward if/else implementation"""
+    
+    def __init__(self, connection_string):
+        self.conn = pyodbc.connect(connection_string)
+    
+    def validate_order(self, order_id):
+        """Main validation logic - direct if/else flow"""
+        
+        # Get sales order
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl FROM sales_orders WHERE sales_order_id = ?",
+            (order_id,)
+        )
+        order = cursor.fetchone()
+        cursor.close()
+        
+        if not order:
+            print(f"Order {order_id} not found")
+            return False
+        
+        region, ship_to_code, ship_to_category, delivery_type, order_time, vdd = order
+        
+        # ==============================================
+        # DECISION 1: If SA and VDD is Null
+        # ==============================================
+        if vdd is None:
+            print(f"VDD is null - proceeding with validation")
+            
+            # ==============================================
+            # CONDITION 3: Check Region
+            # ==============================================
+            if region == "United Arab Emirates":
+                print("Region is UAE")
+                
+                # Check if ship_to_code and category are present
+                if ship_to_code and ship_to_category:
+                    print("Ship to code and category present")
+                    
+                    # Check if master data exists
+                    cursor = self.conn.cursor()
+                    cursor.execute(
+                        "SELECT ship_to_code FROM ship_to_master_data WHERE ship_to_code = ?",
+                        (ship_to_code,)
+                    )
+                    master_data = cursor.fetchone()
+                    cursor.close()
+                    
+                    if not master_data:
+                        print(f"ERROR: Master data not found for {ship_to_code}")
+                        self._add_audit_log(order_id, "Master Data Missing", ship_to_code)
+                        return False
+                    
+                    print("Master data found - proceeding with delivery type validation")
+                else:
+                    print("ERROR: Ship to code or category is null")
+                    return False
+            
+            else:
+                print(f"Region is {region} - proceeding with delivery type validation")
+            
+            # ==============================================
+            # DELIVERY TYPE VALIDATION
+            # ==============================================
+            if delivery_type == "SDD":
+                print("Delivery type is SDD")
+                
+                # Check if order placed at 2pm
+                if order_time and order_time.hour == 14:
+                    print("Order placed at 2pm - Valid for SDD")
+                    self._update_vdd(order_id, "IT")
+                    self._execute_sap(order_id, "SDD 2pm")
+                    return True
+                
+                # Check if order placed at 3pm (gt 2pm)
+                elif order_time and order_time.hour == 15:
+                    print("Order placed at 3pm - checking NDD conditions")
+                    # This is now in NDD window
+                    self._update_vdd(order_id, "LT")
+                    self._execute_sap(order_id, "SDD->NDD at 3pm")
+                    return True
+                
+                else:
+                    print(f"Order time {order_time} not valid for SDD")
+                    return False
+            
+            elif delivery_type == "NDD":
+                print("Delivery type is NDD")
+                
+                # Check if order placed before 4pm (LT 4pm)
+                if order_time and order_time.hour < 16:
+                    print(f"Order placed at {order_time.hour}:00 - Valid for NDD LT")
+                    self._update_vdd(order_id, "LT")
+                    self._execute_sap(order_id, "NDD LT")
+                    return True
+                
+                # Check if order placed at 4pm or later (GT condition)
+                elif order_time and order_time.hour >= 16:
+                    print(f"Order placed at {order_time.hour}:00 - Valid for NDD GT")
+                    self._update_vdd(order_id, "GT")
+                    self._execute_sap(order_id, "NDD GT")
+                    return True
+                
+                else:
+                    print(f"Order time {order_time} not valid for NDD")
+                    return False
+            
+            else:
+                print(f"ERROR: No delivery type found")
+                self._add_audit_log(order_id, "No Delivery Type", None)
+                return False
+        
+        else:
+            print(f"VDD is already set to {vdd} - skipping validation")
+            return True
+    
+    def _update_vdd(self, order_id, vdd_value):
+        """Update VDD field in sales order"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE sales_orders SET vdd_hitl = ?, modified_date = ? WHERE sales_order_id = ?",
+            (vdd_value, datetime.now(), order_id)
+        )
+        self.conn.commit()
+        cursor.close()
+        print(f"Updated {order_id} with VDD: {vdd_value}")
+    
+    def _execute_sap(self, order_id, scenario):
+        """Execute SAP Integration"""
+        print(f"Executing SAP for {order_id} - Scenario: {scenario}")
+        
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO audit_log (sales_order_id, action, description, timestamp) VALUES (?, ?, ?, ?)",
+            (order_id, "SAP Integration", f"Executed: {scenario}", datetime.now())
+        )
+        self.conn.commit()
+        cursor.close()
+    
+    def _add_audit_log(self, order_id, action, description):
+        """Add audit log entry"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO audit_log (sales_order_id, action, description, timestamp) VALUES (?, ?, ?, ?)",
+            (order_id, action, description, datetime.now())
+        )
+        self.conn.commit()
+        cursor.close()
+        print(f"Audit log added: {action}")
+    
+    def close(self):
+        self.conn.close()
+
+
+# ========================================
+# USAGE EXAMPLES
+# ========================================
+
+def example_1():
+    """Example 1: SDD Order at 2pm"""
+    connection_string = (
+        'Driver={ODBC Driver 17 for SQL Server};'
+        'Server=YOUR_SERVER;'
+        'Database=YOUR_DATABASE;'
+        'UID=YOUR_USERNAME;'
+        'PWD=YOUR_PASSWORD;'
+    )
+    
+    validator = SimpleDeliveryValidator(connection_string)
+    
+    # Process order
+    success = validator.validate_order('SO-12345')
+    print(f"Validation successful: {success}\n")
+    
+    validator.close()
+
+
+def example_2():
+    """Example 2: Process Multiple Orders"""
+    connection_string = (
+        'Driver={ODBC Driver 17 for SQL Server};'
+        'Server=YOUR_SERVER;'
+        'Database=YOUR_DATABASE;'
+        'UID=YOUR_USERNAME;'
+        'PWD=YOUR_PASSWORD;'
+    )
+    
+    validator = SimpleDeliveryValidator(connection_string)
+    
+    order_ids = ['SO-001', 'SO-002', 'SO-003', 'SO-004', 'SO-005']
+    
+    for order_id in order_ids:
+        print(f"\n{'='*50}")
+        print(f"Processing {order_id}")
+        print(f"{'='*50}")
+        success = validator.validate_order(order_id)
+        print(f"Result: {'SUCCESS' if success else 'FAILED'}")
+    
+    validator.close()
+
+
+# ========================================
+# DIRECT IF/ELSE LOGIC (No Classes)
+# ========================================
+
+def process_order_simple(order_id, connection_string):
+    """
+    Bare minimum if/else flow logic
+    Useful for understanding the core flow
+    """
+    
+    conn = pyodbc.connect(connection_string)
+    cursor = conn.cursor()
+    
+    # Step 1: Get order
+    cursor.execute(
+        """SELECT region, ship_to_code, ship_to_category, delivery_type, 
+                   order_placed_date, vdd_hitl FROM sales_orders WHERE sales_order_id = ?""",
+        (order_id,)
+    )
+    order = cursor.fetchone()
+    
+    if not order:
+        print("Order not found")
+        return
+    
+    region, ship_to, ship_cat, deliv_type, order_time, vdd = order
+    
+    # Step 2: Check VDD
+    if vdd is None:
+        
+        # Step 3: Check Region
+        if region == "United Arab Emirates":
+            if not ship_to or not ship_cat:
+                print("Ship to code or category is null")
+                return
+            
+            # Check master data
+            cursor.execute("SELECT 1 FROM ship_to_master_data WHERE ship_to_code = ?", (ship_to,))
+            if not cursor.fetchone():
+                print("Master data missing")
+                cursor.close()
+                conn.close()
+                return
+        
+        # Step 4: Check Delivery Type
+        if deliv_type == "SDD":
+            if order_time.hour == 14:
+                vdd_value = "IT"
+                scenario = "SDD 2pm"
+            elif order_time.hour == 15:
+                vdd_value = "LT"
+                scenario = "SDD->NDD"
+            else:
+                print("Invalid SDD time")
+                cursor.close()
+                conn.close()
+                return
+        
+        elif deliv_type == "NDD":
+            if order_time.hour < 16:
+                vdd_value = "LT"
+                scenario = "NDD LT"
+            else:
+                vdd_value = "GT"
+                scenario = "NDD GT"
+        
+        else:
+            print("No delivery type")
+            cursor.close()
+            conn.close()
+            return
+        
+        # Step 5: Update order
+        cursor.execute(
+            "UPDATE sales_orders SET vdd_hitl = ?, modified_date = ? WHERE sales_order_id = ?",
+            (vdd_value, datetime.now(), order_id)
+        )
+        
+        # Step 6: Log to audit
+        cursor.execute(
+            "INSERT INTO audit_log (sales_order_id, action, description, vdd_value, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (order_id, "SAP Integration", f"Executed: {scenario}", vdd_value, datetime.now())
+        )
+        
+        conn.commit()
+        print(f"Order {order_id} updated with VDD: {vdd_value}")
+    
+    else:
+        print(f"Order already processed with VDD: {vdd}")
+    
+    cursor.close()
+    conn.close()
+
+
+if __name__ == "__main__":
+    # Run example
+    connection_string = (
+        'Driver={ODBC Driver 17 for SQL Server};'
+        'Server=YOUR_SERVER;'
+        'Database=YOUR_DATABASE;'
+        'UID=YOUR_USERNAME;'
+        'PWD=YOUR_PASSWORD;'
+    )
+    
+    # Use the simple version
+    process_order_simple('SO-12345', connection_string)
+
+-- ================================================================
+-- DELIVERY DATE VALIDATION FLOW - SQL SETUP SCRIPT
+-- ================================================================
+-- This script creates all required tables and sample data for the
+-- delivery validation flow
+
+-- ================================================================
+-- 1. CREATE TABLES
+-- ================================================================
+
+-- Sales Orders Table
+CREATE TABLE sales_orders (
+    sales_order_id NVARCHAR(50) PRIMARY KEY,
+    created_on_email NVARCHAR(255),
+    region NVARCHAR(100),
+    ship_to_code NVARCHAR(50),
+    ship_to_category NVARCHAR(100),
+    delivery_type NVARCHAR(50),
+    order_placed_date DATETIME,
+    vdd_hitl NVARCHAR(50),
+    created_date DATETIME DEFAULT GETDATE(),
+    modified_date DATETIME DEFAULT GETDATE()
+);
+
+-- Purchase Orders Table
+CREATE TABLE purchase_orders (
+    purchase_order_id NVARCHAR(50) PRIMARY KEY,
+    sales_order_id NVARCHAR(50) NOT NULL,
+    region NVARCHAR(100),
+    created_date DATETIME DEFAULT GETDATE(),
+    FOREIGN KEY (sales_order_id) REFERENCES sales_orders(sales_order_id)
+);
+
+-- Country Master Data Table
+CREATE TABLE country_master_data (
+    country_id INT PRIMARY KEY IDENTITY(1,1),
+    region NVARCHAR(100) UNIQUE,
+    country_code NVARCHAR(10),
+    country_name NVARCHAR(100),
+    created_date DATETIME DEFAULT GETDATE()
+);
+
+-- Ship To Master Data Table
+CREATE TABLE ship_to_master_data (
+    ship_to_id INT PRIMARY KEY IDENTITY(1,1),
+    ship_to_code NVARCHAR(50) UNIQUE,
+    ship_to_category NVARCHAR(100),
+    description NVARCHAR(255),
+    is_active BIT DEFAULT 1,
+    created_date DATETIME DEFAULT GETDATE()
+);
+
+-- Audit Log Table
+CREATE TABLE audit_log (
+    audit_log_id INT PRIMARY KEY IDENTITY(1,1),
+    sales_order_id NVARCHAR(50) NOT NULL,
+    action NVARCHAR(255),
+    description NVARCHAR(MAX),
+    vdd_value NVARCHAR(50),
+    timestamp DATETIME DEFAULT GETDATE(),
+    FOREIGN KEY (sales_order_id) REFERENCES sales_orders(sales_order_id)
+);
+
+-- ================================================================
+-- 2. CREATE INDEXES
+-- ================================================================
+
+CREATE NONCLUSTERED INDEX IX_sales_orders_vdd 
+ON sales_orders(vdd_hitl) 
+WHERE vdd_hitl IS NULL;
+
+CREATE NONCLUSTERED INDEX IX_sales_orders_region 
+ON sales_orders(region);
+
+CREATE NONCLUSTERED INDEX IX_purchase_orders_so_id 
+ON purchase_orders(sales_order_id);
+
+CREATE NONCLUSTERED INDEX IX_audit_log_so_id 
+ON audit_log(sales_order_id);
+
+CREATE NONCLUSTERED INDEX IX_ship_to_code 
+ON ship_to_master_data(ship_to_code);
+
+-- ================================================================
+-- 3. SAMPLE DATA
+-- ================================================================
+
+-- Insert Country Master Data
+INSERT INTO country_master_data (region, country_code, country_name)
+VALUES 
+    ('United Arab Emirates', 'AE', 'UAE'),
+    ('Saudi Arabia', 'SA', 'Saudi Arabia'),
+    ('Kuwait', 'KW', 'Kuwait'),
+    ('Bahrain', 'BH', 'Bahrain'),
+    ('Qatar', 'QA', 'Qatar');
+
+-- Insert Ship To Master Data
+INSERT INTO ship_to_master_data (ship_to_code, ship_to_category, description)
+VALUES 
+    ('SHIP001', 'Standard', 'Standard Delivery Point 1'),
+    ('SHIP002', 'Express', 'Express Delivery Point 2'),
+    ('SHIP003', 'Standard', 'Standard Delivery Point 3'),
+    ('SHIP004', 'Premium', 'Premium Delivery Point 4'),
+    ('SHIP005', 'Standard', 'Standard Delivery Point 5');
+
+-- Insert Sample Sales Orders
+-- Order 1: SDD at 2pm (should get VDD = IT)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-001', 'test1@example.com', 'United Arab Emirates', 'SHIP001', 'Standard', 'SDD', CONVERT(DATETIME, '2024-01-15 14:00:00'), NULL);
+
+-- Order 2: NDD before 4pm (should get VDD = LT)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-002', 'test2@example.com', 'United Arab Emirates', 'SHIP002', 'Express', 'NDD', CONVERT(DATETIME, '2024-01-15 15:00:00'), NULL);
+
+-- Order 3: NDD at 4pm (should get VDD = GT)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-003', 'test3@example.com', 'United Arab Emirates', 'SHIP003', 'Standard', 'NDD', CONVERT(DATETIME, '2024-01-15 16:00:00'), NULL);
+
+-- Order 4: SDD at 3pm (should convert to NDD LT)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-004', 'test4@example.com', 'Saudi Arabia', 'SHIP004', 'Premium', 'SDD', CONVERT(DATETIME, '2024-01-15 15:00:00'), NULL);
+
+-- Order 5: Already processed
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-005', 'test5@example.com', 'United Arab Emirates', 'SHIP005', 'Standard', 'NDD', CONVERT(DATETIME, '2024-01-15 10:00:00'), 'LT');
+
+-- Order 6: Missing delivery type (should error)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-006', 'test6@example.com', 'United Arab Emirates', 'SHIP001', 'Standard', NULL, CONVERT(DATETIME, '2024-01-15 10:00:00'), NULL);
+
+-- Order 7: Missing ship_to_code (should error)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-007', 'test7@example.com', 'United Arab Emirates', NULL, 'Standard', 'SDD', CONVERT(DATETIME, '2024-01-15 14:00:00'), NULL);
+
+-- Order 8: Invalid ship_to_code (no master data)
+INSERT INTO sales_orders (sales_order_id, created_on_email, region, ship_to_code, ship_to_category, delivery_type, order_placed_date, vdd_hitl)
+VALUES ('SO-008', 'test8@example.com', 'United Arab Emirates', 'INVALID99', 'Standard', 'SDD', CONVERT(DATETIME, '2024-01-15 14:00:00'), NULL);
+
+-- Insert Purchase Orders
+INSERT INTO purchase_orders (purchase_order_id, sales_order_id, region)
+VALUES 
+    ('PO-001', 'SO-001', 'United Arab Emirates'),
+    ('PO-002', 'SO-002', 'United Arab Emirates'),
+    ('PO-003', 'SO-003', 'United Arab Emirates'),
+    ('PO-004', 'SO-004', 'Saudi Arabia'),
+    ('PO-005', 'SO-005', 'United Arab Emirates');
+
+-- ================================================================
+-- 4. STORED PROCEDURES (OPTIONAL)
+-- ================================================================
+
+-- Procedure to get unprocessed orders
+CREATE PROCEDURE sp_GetUnprocessedOrders
+AS
+BEGIN
+    SELECT 
+        sales_order_id,
+        region,
+        delivery_type,
+        order_placed_date,
+        created_date
+    FROM sales_orders
+    WHERE vdd_hitl IS NULL
+    ORDER BY created_date DESC;
+END;
+
+-- Procedure to update order status
+CREATE PROCEDURE sp_UpdateOrderVDD
+    @SalesOrderId NVARCHAR(50),
+    @VDDValue NVARCHAR(50)
+AS
+BEGIN
+    UPDATE sales_orders
+    SET vdd_hitl = @VDDValue,
+        modified_date = GETDATE()
+    WHERE sales_order_id = @SalesOrderId;
+    
+    -- Add to audit log
+    INSERT INTO audit_log (sales_order_id, action, description, vdd_value, timestamp)
+    VALUES (@SalesOrderId, 'VDD Updated', 'Updated via stored procedure', @VDDValue, GETDATE());
+END;
+
+-- Procedure to get validation errors
+CREATE PROCEDURE sp_GetValidationErrors
+AS
+BEGIN
+    SELECT 
+        sales_order_id,
+        action,
+        description,
+        timestamp
+    FROM audit_log
+    WHERE action LIKE '%Error%' OR action LIKE '%Missing%'
+    ORDER BY timestamp DESC;
+END;
+
+-- ================================================================
+-- 5. VIEWS (OPTIONAL)
+-- ================================================================
+
+-- View for orders requiring validation
+CREATE VIEW v_OrdersRequiringValidation AS
+SELECT 
+    so.sales_order_id,
+    so.created_on_email,
+    so.region,
+    so.delivery_type,
+    so.order_placed_date,
+    po.purchase_order_id,
+    CASE 
+        WHEN so.vdd_hitl IS NULL THEN 'Pending'
+        ELSE 'Processed'
+    END AS status
+FROM sales_orders so
+LEFT JOIN purchase_orders po ON so.sales_order_id = po.sales_order_id
+WHERE so.vdd_hitl IS NULL;
+
+-- View for validation audit trail
+CREATE VIEW v_ValidationAuditTrail AS
+SELECT 
+    al.audit_log_id,
+    al.sales_order_id,
+    so.delivery_type,
+    so.order_placed_date,
+    al.action,
+    al.description,
+    al.vdd_value,
+    al.timestamp
+FROM audit_log al
+JOIN sales_orders so ON al.sales_order_id = so.sales_order_id
+ORDER BY al.timestamp DESC;
+
+-- ================================================================
+-- 6. USEFUL QUERIES
+-- ================================================================
+
+-- Query 1: Get all unprocessed orders by region
+SELECT 
+    region,
+    COUNT(*) as unprocessed_count,
+    COUNT(CASE WHEN delivery_type = 'SDD' THEN 1 END) as sdd_count,
+    COUNT(CASE WHEN delivery_type = 'NDD' THEN 1 END) as ndd_count
+FROM sales_orders
+WHERE vdd_hitl IS NULL
+GROUP BY region;
+
+-- Query 2: Orders missing required master data
+SELECT DISTINCT
+    so.sales_order_id,
+    so.ship_to_code,
+    so.delivery_type
+FROM sales_orders so
+LEFT JOIN ship_to_master_data stm ON so.ship_to_code = stm.ship_to_code
+WHERE so.vdd_hitl IS NULL
+AND (so.ship_to_code IS NULL OR stm.ship_to_code IS NULL);
+
+-- Query 3: Validation errors summary
+SELECT 
+    action,
+    COUNT(*) as error_count,
+    MIN(timestamp) as first_occurrence,
+    MAX(timestamp) as last_occurrence
+FROM audit_log
+WHERE action LIKE '%Error%' OR action LIKE '%Missing%'
+GROUP BY action
+ORDER BY error_count DESC;
+
+-- Query 4: Orders processed by VDD type
+SELECT 
+    vdd_hitl,
+    COUNT(*) as order_count,
+    MIN(modified_date) as first_processed,
+    MAX(modified_date) as last_processed
+FROM sales_orders
+WHERE vdd_hitl IS NOT NULL
+GROUP BY vdd_hitl;
+
+-- Query 5: Orders by delivery time window
+SELECT 
+    DATEPART(HOUR, order_placed_date) as order_hour,
+    delivery_type,
+    COUNT(*) as count
+FROM sales_orders
+GROUP BY DATEPART(HOUR, order_placed_date), delivery_type
+ORDER BY order_hour;
+
+-- ================================================================
+-- 7. DATA MAINTENANCE SCRIPTS
+-- ================================================================
+
+-- Clear all test data
+-- DELETE FROM audit_log;
+-- DELETE FROM purchase_orders;
+-- DELETE FROM sales_orders;
+-- DELETE FROM ship_to_master_data;
+-- DELETE FROM country_master_data;
+
+-- Archive old audit logs (older than 30 days)
+-- Note: Create archive table first
+-- INSERT INTO audit_log_archive
+-- SELECT * FROM audit_log WHERE timestamp < DATEADD(DAY, -30, GETDATE());
+-- DELETE FROM audit_log WHERE timestamp < DATEADD(DAY, -30, GETDATE());
+
+-- ================================================================
+-- SAMPLE TEST QUERIES
+-- ================================================================
+
+-- Test: View all unprocessed orders
+SELECT * FROM v_OrdersRequiringValidation;
+
+-- Test: View audit trail
+SELECT * FROM v_ValidationAuditTrail;
+
+-- Test: Check specific order
+SELECT * FROM sales_orders WHERE sales_order_id = 'SO-001';
+
+-- Test: Get purchase order for sales order
+SELECT * FROM purchase_orders WHERE sales_order_id = 'SO-001';
+
+-- Test: Get master data
+SELECT * FROM ship_to_master_data WHERE ship_to_code = 'SHIP001';
+SELECT * FROM country_master_data WHERE region = 'United Arab Emirates';
+
+-- ================================================================
+-- CLEANUP (Run these to reset for testing)
+-- ================================================================
+
+-- Reset audit log for specific order
+-- DELETE FROM audit_log WHERE sales_order_id = 'SO-001';
+
+-- Reset VDD for testing
+-- UPDATE sales_orders SET vdd_hitl = NULL, modified_date = GETDATE() WHERE sales_order_id = 'SO-001';
